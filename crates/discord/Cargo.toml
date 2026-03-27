@@ -1,0 +1,14 @@
+[package]
+name = "discodb-discord"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+discodb-types = { path = "../types" }
+discodb-observability = { path = "../observability" }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

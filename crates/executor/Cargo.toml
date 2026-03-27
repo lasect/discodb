@@ -1,0 +1,12 @@
+[package]
+name = "discodb-executor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+discodb-types = { path = "../types" }
+discodb-observability = { path = "../observability" }
+discodb-storage = { path = "../storage" }
+discodb-catalog = { path = "../catalog" }
+discodb-mvcc = { path = "../mvcc" }
+thiserror = "2.0"
