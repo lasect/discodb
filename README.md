@@ -14,7 +14,7 @@ discodb treats Discord as a distributed storage backend:
 - **Threads** → TOAST/overflow storage
 - **Attachments** → Blob storage
 
-Built in Rust, discodb exposes a PostgreSQL-compatible wire protocol, so you can connect using `psql`:
+Built in Go, discodb exposes a PostgreSQL-compatible wire protocol, so you can connect using `psql`:
 
 ```bash
 psql -h localhost -d discorddb
@@ -81,12 +81,30 @@ Your standard database with Discord as the underlying storage engine.
 ## Building
 
 ```bash
-cargo build --release
+go build ./...
 ```
 
 ## Configuration
 
-discodb requires a Discord bot token and configured guild. See `crates/config` for configuration options.
+discodb requires a Discord bot token and configured guild. You can run it with a JSON config file, environment variables, or both.
+
+```bash
+go run ./cmd/discodb -config ./config/discodb.example.json -print-config
+go run ./cmd/discodb -config ./config/discodb.example.json -check-config
+go run ./cmd/discodb -config ./config/discodb.example.json -serve -addr :55432
+```
+
+The effective load order is:
+
+- built-in defaults
+- JSON file from `-config` or `DISCODB_CONFIG`
+- environment overrides such as `DISCORD_BOT_TOKEN`, `DISCORD_BOT_TOKEN_WAL`, `DISCORD_BOT_TOKEN_HEAP`, `DISCORD_BOT_TOKEN_INDEX`, `DISCORD_BOT_TOKEN_CATALOG`, `DISCORD_BOT_TOKEN_OVERFLOW`, `DISCORD_GUILD_ID`, `DISCODB_LOG_LEVEL`, and `DISCODB_LOG_FILE`
+
+The example file lives at [`config/discodb.example.json`](/home/winit/code/work/lasect/discodb/config/discodb.example.json).
+
+The scheduler model uses five token classes from [`ai-docs/06_scheduler.md`](/home/winit/code/work/lasect/discodb/ai-docs/06_scheduler.md): `wal`, `heap`, `index`, `catalog`, and `overflow`.
+
+`DISCORD_BOT_TOKEN` is treated as a compatibility shortcut and is copied to all five token classes unless a per-class env var overrides one of them.
 
 ## Status
 

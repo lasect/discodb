@@ -1,0 +1,51 @@
+{
+  "discord": {
+    "tokens": {
+      "wal": "replace-me-wal",
+      "heap": "replace-me-heap",
+      "index": "replace-me-index",
+      "catalog": "replace-me-catalog",
+      "overflow": "replace-me-overflow"
+    },
+    "guild_ids": [123456789012345678],
+    "boot_channel_name": "#discorddb-boot",
+    "request_timeout_secs": 30,
+    "max_retries": 3
+  },
+  "storage": {
+    "catalog_category_prefix": "discodb-catalog",
+    "wal_channel_name": "discodb-wal",
+    "heap_channel_prefix": "discodb-heap",
+    "fsm_role_prefix": "discodb-fsm",
+    "index_channel_prefix": "discodb-index"
+  },
+  "scheduler": {
+    "wal_queue_size": 1000,
+    "heap_queue_size": 500,
+    "index_queue_size": 200,
+    "catalog_queue_size": 100,
+    "overflow_queue_size": 100,
+    "rate_limit_burst": 50,
+    "rate_limit_per_second": 50,
+    "retry_delay_ms": 100,
+    "max_retry_delay_ms": 30000
+  },
+  "features": {
+    "enable_forum_indexes": false,
+    "enable_mvcc": true,
+    "enable_fsm": false,
+    "enable_reactions": true,
+    "enable_blobs": false,
+    "enable_multi_guild": false,
+    "enable_distributed_locks": false,
+    "phase2_indexes": false,
+    "phase3_multi_guild": false
+  },
+  "logging": {
+    "level": "info",
+    "format": "pretty",
+    "output": {
+      "mode": "stdout"
+    }
+  }
+}

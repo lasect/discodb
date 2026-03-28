@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+# Always write NOTES.md in the same directory as this script
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FILE="$SCRIPT_DIR/NOTES.md"
+
+# Get current date and time in DD/MM - HH/MM
+DATE_TIME=$(date "+%d/%m - %H:%M")
+
+# Get the note text from all arguments
+NOTE="$*"
+
+# If no argument is given, print usage and exit
+if [ -z "$NOTE" ]; then
+    echo "Usage: $0 \"your note text here\""
+    exit 1
+fi
+
+# Append to NOTES.md in the script's directory
+echo "- $DATE_TIME: \"$NOTE\"" >> "$FILE"
+
+echo "Saved to $FILE"
