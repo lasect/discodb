@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"hash/crc32"
 
 	"discodb/types"
@@ -49,6 +50,7 @@ type ColumnValue struct {
 	Text    *string         `json:"text,omitempty"`
 	JSON    json.RawMessage `json:"json,omitempty"`
 	BlobRef *BlobRef        `json:"blob_ref,omitempty"`
+	Raw     []byte          `json:"-"` // Raw byte data for blob/attachment handling
 }
 
 type RowBody struct {
@@ -60,8 +62,11 @@ type Row struct {
 	Body   RowBody   `json:"body"`
 }
 
+// RowHeaderSize is the fixed size of encoded row header in bytes
+const RowHeaderSize = 53 // 6x uint64 (48) + flags (1) + checksum (4)
+
 func EncodeRowHeader(header RowHeader) []byte {
-	buf := make([]byte, 49)
+	buf := make([]byte, RowHeaderSize)
 	binary.BigEndian.PutUint64(buf[0:8], header.RowID.Uint64())
 	binary.BigEndian.PutUint64(buf[8:16], header.TableID.Uint64())
 	binary.BigEndian.PutUint64(buf[16:24], header.SegmentID.Uint64())
@@ -69,11 +74,12 @@ func EncodeRowHeader(header RowHeader) []byte {
 	binary.BigEndian.PutUint64(buf[32:40], header.TxnID.Uint64())
 	binary.BigEndian.PutUint64(buf[40:48], header.LSN.Uint64())
 	buf[48] = byte(header.Flags)
+	binary.BigEndian.PutUint32(buf[49:53], header.Checksum)
 	return buf
 }
 
 func DecodeRowHeader(data []byte) (RowHeader, bool) {
-	if len(data) < 49 {
+	if len(data) < RowHeaderSize {
 		return RowHeader{}, false
 	}
 	return RowHeader{
@@ -84,6 +90,7 @@ func DecodeRowHeader(data []byte) (RowHeader, bool) {
 		TxnID:     types.MustTxnID(binary.BigEndian.Uint64(data[32:40])),
 		LSN:       types.MustLSN(binary.BigEndian.Uint64(data[40:48])),
 		Flags:     RowFlags(data[48]),
+		Checksum:  binary.BigEndian.Uint32(data[49:53]),
 	}, true
 }
 
@@ -102,6 +109,29 @@ func DecodeRowBody(data []byte) (RowBody, bool) {
 
 func ComputeChecksum(data []byte) uint32 {
 	return crc32.ChecksumIEEE(data)
+}
+
+// ComputeRowChecksum computes checksum for a row (over body data)
+func ComputeRowChecksum(body RowBody) uint32 {
+	bodyData := EncodeRowBody(body)
+	return ComputeChecksum(bodyData)
+}
+
+// ValidateRowChecksum verifies the checksum in a row header matches the body
+func ValidateRowChecksum(header RowHeader, body RowBody) bool {
+	expected := ComputeRowChecksum(body)
+	return header.Checksum == expected
+}
+
+// ChecksumError represents a checksum validation failure
+type ChecksumError struct {
+	Expected uint32
+	Actual   uint32
+	RowID    types.RowID
+}
+
+func (e ChecksumError) Error() string {
+	return fmt.Sprintf("checksum mismatch for row %d: expected %08x, got %08x", e.RowID, e.Expected, e.Actual)
 }
 
 func EncodeMessageContent(header RowHeader) string {
