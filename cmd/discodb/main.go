@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"discodb/config"
+	"discodb/engine"
 	"discodb/observability"
 	"discodb/wire"
 )
@@ -64,7 +65,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	server := wire.NewServer(*addr, logger)
+	eng, err := engine.NewEngine(cfg, logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "init engine: %v\n", err)
+		os.Exit(1)
+	}
+	defer eng.Close()
+
+	server := wire.NewServer(*addr, logger, eng)
 	logger.Info("starting wire server", slog.String("addr", *addr))
 	if err := server.ListenAndServe(); err != nil {
 		fmt.Fprintf(os.Stderr, "wire server failed: %v\n", err)

@@ -116,4 +116,20 @@ func (c *Catalog) Epoch() types.SchemaEpoch {
 	return c.epoch
 }
 
+func (c *Catalog) Tables() map[types.TableID]TableSchema {
+	out := make(map[types.TableID]TableSchema, len(c.tables))
+	for k, v := range c.tables {
+		out[k] = v
+	}
+	return out
+}
+
+func (c *Catalog) Indexes() map[types.TableID]IndexSchema {
+	out := make(map[types.TableID]IndexSchema, len(c.indexes))
+	for k, v := range c.indexes {
+		out[k] = v
+	}
+	return out
+}
+
 var SystemTables = []string{"sys_tables", "sys_columns", "sys_indexes"}

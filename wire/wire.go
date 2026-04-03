@@ -8,8 +8,9 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 
-	discodbsql "discodb/sql"
+	"discodb/engine"
 	"discodb/types"
 )
 
@@ -47,10 +48,19 @@ type FieldDescription struct {
 type CommandTag struct {
 	Command string
 	Rows    *uint64
+	Oid     uint64
 }
 
 func SelectTag(rows uint64) CommandTag {
 	return CommandTag{Command: "SELECT", Rows: &rows}
+}
+
+func InsertTag(rows uint64) CommandTag {
+	return CommandTag{Command: "INSERT", Rows: &rows}
+}
+
+func CreateTableTag() CommandTag {
+	return CommandTag{Command: "CREATE TABLE"}
 }
 
 type ErrorResponse struct {
@@ -70,16 +80,16 @@ func InternalError(message string) ErrorResponse {
 }
 
 type Server struct {
-	addr    string
-	logger  *slog.Logger
-	planner discodbsql.Planner
+	addr   string
+	logger *slog.Logger
+	engine *engine.Engine
 }
 
-func NewServer(addr string, logger *slog.Logger) *Server {
+func NewServer(addr string, logger *slog.Logger, eng *engine.Engine) *Server {
 	return &Server{
-		addr:    addr,
-		logger:  logger,
-		planner: discodbsql.NewPlanner(),
+		addr:   addr,
+		logger: logger,
+		engine: eng,
 	}
 }
 
@@ -89,6 +99,8 @@ func (s *Server) ListenAndServe() error {
 		return err
 	}
 	defer ln.Close()
+
+	s.logger.Info("wire server listening", slog.String("addr", s.addr))
 
 	for {
 		conn, err := ln.Accept()
@@ -106,6 +118,9 @@ func (s *Server) ListenAndServe() error {
 func (s *Server) handleConnection(ctx context.Context, conn net.Conn) error {
 	defer conn.Close()
 
+	if err := handleSSLNegotiation(conn); err != nil {
+		return err
+	}
 	if err := readStartup(conn); err != nil {
 		return err
 	}
@@ -160,6 +175,22 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) error {
 	}
 }
 
+func handleSSLNegotiation(conn net.Conn) error {
+	buf := make([]byte, 8)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	length := binary.BigEndian.Uint32(buf[0:4])
+	code := binary.BigEndian.Uint32(buf[4:8])
+
+	if length == 8 && code == 80877103 {
+		conn.Write([]byte{'N'})
+		return nil
+	}
+
+	return fmt.Errorf("expected SSLRequest or StartupMessage, got length=%d code=%d", length, code)
+}
+
 func readStartup(conn net.Conn) error {
 	lengthBuf := make([]byte, 4)
 	if _, err := io.ReadFull(conn, lengthBuf); err != nil {
@@ -176,23 +207,73 @@ func readStartup(conn net.Conn) error {
 
 func (s *Server) executeQuery(ctx context.Context, conn net.Conn, query string) error {
 	_ = ctx
-	stmt, err := discodbsql.Parse(query)
-	if err != nil {
-		_, writeErr := conn.Write(serializeErrorResponse(SyntaxError(err.Error())))
-		return writeErr
+
+	query = strings.TrimSpace(query)
+	if query == "" || query == ";" {
+		if _, err := conn.Write(serializeReadyForQuery(QueryStatusIdle)); err != nil {
+			return err
+		}
+		return nil
 	}
-	if _, err := s.planner.Plan(stmt); err != nil {
+
+	cols, rows, affectedRows, err := s.engine.ExecuteQuery(query)
+	if err != nil {
 		_, writeErr := conn.Write(serializeErrorResponse(InternalError(err.Error())))
 		return writeErr
 	}
 
-	if _, err := conn.Write(serializeRowDescription(nil)); err != nil {
+	if cols != nil {
+		fields := make([]FieldDescription, len(cols))
+		for i, col := range cols {
+			fields[i] = FieldDescription{
+				Name:        col.Name,
+				TableOID:    0,
+				ColumnIndex: uint16(col.Ordinal),
+				TypeOID:     25,
+				TypeSize:    -1,
+				Format:      0,
+			}
+		}
+		if _, err := conn.Write(serializeRowDescription(fields)); err != nil {
+			return err
+		}
+	} else {
+		if _, err := conn.Write(serializeRowDescription(nil)); err != nil {
+			return err
+		}
+	}
+
+	for _, row := range rows {
+		values := make([]*string, len(row.Values))
+		for j, v := range row.Values {
+			text := ValueToPGText(v)
+			values[j] = &text
+		}
+		if _, err := conn.Write(serializeDataRow(values)); err != nil {
+			return err
+		}
+	}
+
+	tag := determineCommandTag(query, affectedRows)
+	if _, err := conn.Write(serializeCommandComplete(tag)); err != nil {
 		return err
 	}
-	if _, err := conn.Write(serializeCommandComplete(SelectTag(0))); err != nil {
-		return err
-	}
+
 	return nil
+}
+
+func determineCommandTag(query string, rowCount uint64) CommandTag {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	switch {
+	case strings.HasPrefix(upper, "SELECT"):
+		return SelectTag(rowCount)
+	case strings.HasPrefix(upper, "INSERT"):
+		return InsertTag(rowCount)
+	case strings.HasPrefix(upper, "CREATE TABLE"):
+		return CreateTableTag()
+	default:
+		return CommandTag{Command: strings.Fields(upper)[0]}
+	}
 }
 
 func serializeAuthenticationOK() []byte {
@@ -235,7 +316,9 @@ func serializeDataRow(values []*string) []byte {
 
 func serializeCommandComplete(tag CommandTag) []byte {
 	var content string
-	if tag.Rows != nil {
+	if tag.Command == "INSERT" && tag.Rows != nil {
+		content = fmt.Sprintf("%s %d %d", tag.Command, tag.Oid, *tag.Rows)
+	} else if tag.Rows != nil {
 		content = fmt.Sprintf("%s %d", tag.Command, *tag.Rows)
 	} else {
 		content = tag.Command

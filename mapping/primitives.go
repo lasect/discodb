@@ -34,12 +34,12 @@ type Segment struct {
 
 // SegmentName generates the canonical channel name for a segment
 func SegmentName(tableID types.TableID, segmentID types.SegmentID) string {
-	return fmt.Sprintf("seg::%d::%d", tableID, segmentID)
+	return fmt.Sprintf("seg-%d-%d", tableID, segmentID)
 }
 
 // ParseSegmentName extracts table and segment IDs from channel name
 func ParseSegmentName(name string) (types.TableID, types.SegmentID, error) {
-	parts := strings.Split(name, "::")
+	parts := strings.Split(name, "-")
 	if len(parts) != 3 || parts[0] != "seg" {
 		return 0, 0, fmt.Errorf("invalid segment name format: %s", name)
 	}

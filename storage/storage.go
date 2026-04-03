@@ -86,7 +86,7 @@ func DecodeRowHeader(data []byte) (RowHeader, bool) {
 		RowID:     types.MustRowID(binary.BigEndian.Uint64(data[0:8])),
 		TableID:   types.MustTableID(binary.BigEndian.Uint64(data[8:16])),
 		SegmentID: types.MustSegmentID(binary.BigEndian.Uint64(data[16:24])),
-		MessageID: types.MustMessageID(binary.BigEndian.Uint64(data[24:32])),
+		MessageID: types.MessageID(binary.BigEndian.Uint64(data[24:32])),
 		TxnID:     types.MustTxnID(binary.BigEndian.Uint64(data[32:40])),
 		LSN:       types.MustLSN(binary.BigEndian.Uint64(data[40:48])),
 		Flags:     RowFlags(data[48]),
