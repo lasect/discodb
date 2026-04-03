@@ -6,8 +6,6 @@ import (
 	"io"
 
 	"discodb/types"
-
-	"github.com/bwmarrin/discordgo"
 )
 
 // MessageSendParams contains parameters for sending a message.
@@ -55,57 +53,11 @@ type MessagesListParams struct {
 func (c *Client) SendMessage(ctx context.Context, channelID types.ChannelID, params MessageSendParams) (*Message, error) {
 	const op = "SendMessage"
 
-	data := &discordgo.MessageSend{
-		Content: params.Content,
-	}
-
-	// Convert embeds
-	for _, e := range params.Embeds {
-		data.Embeds = append(data.Embeds, embedToDiscordgo(e))
-	}
-
-	// Set allowed mentions - default to none for discodb
-	if params.AllowedMentions != nil {
-		parsedTypes := make([]discordgo.AllowedMentionType, len(params.AllowedMentions.Parse))
-		for i, p := range params.AllowedMentions.Parse {
-			parsedTypes[i] = discordgo.AllowedMentionType(p)
-		}
-		data.AllowedMentions = &discordgo.MessageAllowedMentions{
-			Parse:       parsedTypes,
-			Users:       params.AllowedMentions.Users,
-			Roles:       params.AllowedMentions.Roles,
-			RepliedUser: params.AllowedMentions.RepliedUser,
-		}
-	} else {
-		// Default: no mentions parsed (important for discodb index consistency)
-		data.AllowedMentions = &discordgo.MessageAllowedMentions{
-			Parse: []discordgo.AllowedMentionType{},
-		}
-	}
-
-	// Add file if present
-	if params.File != nil {
-		data.Files = []*discordgo.File{
-			{
-				Name:   params.File.Name,
-				Reader: params.File.Reader,
-			},
-		}
-	}
-
 	var result *Message
 	err := c.withRetry(ctx, op, func() error {
-		msg, err := c.session.ChannelMessageSendComplex(
-			channelIDToString(channelID),
-			data,
-			c.requestOption(ctx)...,
-		)
-		if err != nil {
-			return wrapError(op, err)
-		}
-
-		result, err = messageFromDiscordgo(msg)
-		return err
+		var err error
+		result, err = c.backend.SendMessage(ctx, channelIDToString(channelID), params)
+		return c.normalizeError(op, err)
 	})
 
 	if err != nil {
@@ -142,17 +94,9 @@ func (c *Client) GetMessage(ctx context.Context, channelID types.ChannelID, mess
 
 	var result *Message
 	err := c.withRetry(ctx, op, func() error {
-		msg, err := c.session.ChannelMessage(
-			channelIDToString(channelID),
-			messageIDToString(messageID),
-			c.requestOption(ctx)...,
-		)
-		if err != nil {
-			return wrapError(op, err)
-		}
-
-		result, err = messageFromDiscordgo(msg)
-		return err
+		var err error
+		result, err = c.backend.GetMessage(ctx, channelIDToString(channelID), messageIDToString(messageID))
+		return c.normalizeError(op, err)
 	})
 
 	if err != nil {
@@ -184,31 +128,9 @@ func (c *Client) ListMessages(ctx context.Context, channelID types.ChannelID, pa
 
 	var results []*Message
 	err := c.withRetry(ctx, op, func() error {
-		messages, err := c.session.ChannelMessages(
-			channelIDToString(channelID),
-			limit,
-			beforeID,
-			afterID,
-			aroundID,
-			c.requestOption(ctx)...,
-		)
-		if err != nil {
-			return wrapError(op, err)
-		}
-
-		results = make([]*Message, 0, len(messages))
-		for _, msg := range messages {
-			m, err := messageFromDiscordgo(msg)
-			if err != nil {
-				c.logger.Warn("skipping invalid message",
-					"message_id", msg.ID,
-					"error", err,
-				)
-				continue
-			}
-			results = append(results, m)
-		}
-		return nil
+		var err error
+		results, err = c.backend.ListMessages(ctx, channelIDToString(channelID), limit, beforeID, afterID, aroundID)
+		return c.normalizeError(op, err)
 	})
 
 	if err != nil {
@@ -254,37 +176,11 @@ func (c *Client) ListAllMessages(ctx context.Context, channelID types.ChannelID,
 func (c *Client) EditMessage(ctx context.Context, channelID types.ChannelID, messageID types.MessageID, params MessageEditParams) (*Message, error) {
 	const op = "EditMessage"
 
-	edit := &discordgo.MessageEdit{
-		Channel: channelIDToString(channelID),
-		ID:      messageIDToString(messageID),
-	}
-
-	if params.Content != nil {
-		edit.Content = params.Content
-	}
-
-	if len(params.Embeds) > 0 {
-		embeds := make([]*discordgo.MessageEmbed, len(params.Embeds))
-		for i, e := range params.Embeds {
-			embeds[i] = embedToDiscordgo(e)
-		}
-		edit.Embeds = &embeds
-	}
-
-	// Disable mentions on edit
-	edit.AllowedMentions = &discordgo.MessageAllowedMentions{
-		Parse: []discordgo.AllowedMentionType{},
-	}
-
 	var result *Message
 	err := c.withRetry(ctx, op, func() error {
-		msg, err := c.session.ChannelMessageEditComplex(edit, c.requestOption(ctx)...)
-		if err != nil {
-			return wrapError(op, err)
-		}
-
-		result, err = messageFromDiscordgo(msg)
-		return err
+		var err error
+		result, err = c.backend.EditMessage(ctx, channelIDToString(channelID), messageIDToString(messageID), params)
+		return c.normalizeError(op, err)
 	})
 
 	if err != nil {
@@ -373,11 +269,7 @@ func (c *Client) PinMessage(ctx context.Context, channelID types.ChannelID, mess
 	const op = "PinMessage"
 
 	err := c.withRetry(ctx, op, func() error {
-		return wrapError(op, c.session.ChannelMessagePin(
-			channelIDToString(channelID),
-			messageIDToString(messageID),
-			c.requestOption(ctx)...,
-		))
+		return c.normalizeError(op, c.backend.PinMessage(ctx, channelIDToString(channelID), messageIDToString(messageID)))
 	})
 
 	if err != nil {
@@ -397,11 +289,7 @@ func (c *Client) UnpinMessage(ctx context.Context, channelID types.ChannelID, me
 	const op = "UnpinMessage"
 
 	err := c.withRetry(ctx, op, func() error {
-		return wrapError(op, c.session.ChannelMessageUnpin(
-			channelIDToString(channelID),
-			messageIDToString(messageID),
-			c.requestOption(ctx)...,
-		))
+		return c.normalizeError(op, c.backend.UnpinMessage(ctx, channelIDToString(channelID), messageIDToString(messageID)))
 	})
 
 	if err != nil {
@@ -422,27 +310,9 @@ func (c *Client) ListPinnedMessages(ctx context.Context, channelID types.Channel
 
 	var results []*Message
 	err := c.withRetry(ctx, op, func() error {
-		messages, err := c.session.ChannelMessagesPinned(
-			channelIDToString(channelID),
-			c.requestOption(ctx)...,
-		)
-		if err != nil {
-			return wrapError(op, err)
-		}
-
-		results = make([]*Message, 0, len(messages))
-		for _, msg := range messages {
-			m, err := messageFromDiscordgo(msg)
-			if err != nil {
-				c.logger.Warn("skipping invalid pinned message",
-					"message_id", msg.ID,
-					"error", err,
-				)
-				continue
-			}
-			results = append(results, m)
-		}
-		return nil
+		var err error
+		results, err = c.backend.ListPinnedMessages(ctx, channelIDToString(channelID))
+		return c.normalizeError(op, err)
 	})
 
 	if err != nil {

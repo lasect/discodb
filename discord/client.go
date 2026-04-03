@@ -2,6 +2,7 @@ package discord
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 // normalizes errors, and provides context-aware operations.
 type Client struct {
 	session *discordgo.Session
+	backend Transport
 	logger  *slog.Logger
 
 	// Default request timeout
@@ -69,6 +71,28 @@ func NewClient(token string, opts ...ClientOption) (*Client, error) {
 
 	client := &Client{
 		session:    session,
+		backend:    newDiscordgoTransport(session),
+		logger:     slog.Default(),
+		timeout:    30 * time.Second,
+		maxRetries: 3,
+	}
+
+	for _, opt := range opts {
+		opt(client)
+	}
+
+	return client, nil
+}
+
+// NewClientWithTransport creates a client backed by a custom transport.
+// This is primarily used for deterministic tests without live Discord I/O.
+func NewClientWithTransport(backend Transport, opts ...ClientOption) (*Client, error) {
+	if backend == nil {
+		return nil, fmt.Errorf("discord: backend is required")
+	}
+
+	client := &Client{
+		backend:    backend,
 		logger:     slog.Default(),
 		timeout:    30 * time.Second,
 		maxRetries: 3,
@@ -89,6 +113,9 @@ func (c *Client) Session() *discordgo.Session {
 
 // Close closes the Discord client connection.
 func (c *Client) Close() error {
+	if c.session == nil {
+		return nil
+	}
 	return c.session.Close()
 }
 
@@ -189,4 +216,18 @@ func (c *Client) withRetry(ctx context.Context, op string, fn func() error) erro
 	}
 
 	return fmt.Errorf("%s: max retries exceeded: %w", op, lastErr)
+}
+
+func (c *Client) normalizeError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return err
+	}
+	if _, ok := c.backend.(*discordgoTransport); ok {
+		return wrapError(op, err)
+	}
+	return err
 }

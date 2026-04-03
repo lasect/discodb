@@ -5,8 +5,6 @@ import (
 	"fmt"
 
 	"discodb/types"
-
-	"github.com/bwmarrin/discordgo"
 )
 
 // ChannelCreateParams contains parameters for creating a channel.
@@ -32,13 +30,9 @@ func (c *Client) GetChannel(ctx context.Context, channelID types.ChannelID) (*Ch
 
 	var result *Channel
 	err := c.withRetry(ctx, op, func() error {
-		ch, err := c.session.Channel(channelIDToString(channelID), c.requestOption(ctx)...)
-		if err != nil {
-			return wrapError(op, err)
-		}
-
-		result, err = channelFromDiscordgo(ch)
-		return err
+		var err error
+		result, err = c.backend.GetChannel(ctx, channelIDToString(channelID))
+		return c.normalizeError(op, err)
 	})
 
 	if err != nil {
@@ -53,24 +47,9 @@ func (c *Client) ListGuildChannels(ctx context.Context, guildID types.GuildID) (
 
 	var results []*Channel
 	err := c.withRetry(ctx, op, func() error {
-		channels, err := c.session.GuildChannels(guildIDToString(guildID), c.requestOption(ctx)...)
-		if err != nil {
-			return wrapError(op, err)
-		}
-
-		results = make([]*Channel, 0, len(channels))
-		for _, ch := range channels {
-			channel, err := channelFromDiscordgo(ch)
-			if err != nil {
-				c.logger.Warn("skipping invalid channel",
-					"channel_id", ch.ID,
-					"error", err,
-				)
-				continue
-			}
-			results = append(results, channel)
-		}
-		return nil
+		var err error
+		results, err = c.backend.ListGuildChannels(ctx, guildIDToString(guildID))
+		return c.normalizeError(op, err)
 	})
 
 	if err != nil {
@@ -83,30 +62,11 @@ func (c *Client) ListGuildChannels(ctx context.Context, guildID types.GuildID) (
 func (c *Client) CreateChannel(ctx context.Context, guildID types.GuildID, params ChannelCreateParams) (*Channel, error) {
 	const op = "CreateChannel"
 
-	data := discordgo.GuildChannelCreateData{
-		Name:     params.Name,
-		Type:     discordgo.ChannelType(params.Type),
-		Topic:    params.Topic,
-		Position: params.Position,
-	}
-
-	if params.ParentID != nil {
-		data.ParentID = channelIDToString(*params.ParentID)
-	}
-
 	var result *Channel
 	err := c.withRetry(ctx, op, func() error {
-		ch, err := c.session.GuildChannelCreateComplex(
-			guildIDToString(guildID),
-			data,
-			c.requestOption(ctx)...,
-		)
-		if err != nil {
-			return wrapError(op, err)
-		}
-
-		result, err = channelFromDiscordgo(ch)
-		return err
+		var err error
+		result, err = c.backend.CreateChannel(ctx, guildIDToString(guildID), params)
+		return c.normalizeError(op, err)
 	})
 
 	if err != nil {
@@ -153,35 +113,11 @@ func (c *Client) CreateForumChannel(ctx context.Context, guildID types.GuildID, 
 func (c *Client) EditChannel(ctx context.Context, channelID types.ChannelID, params ChannelEditParams) (*Channel, error) {
 	const op = "EditChannel"
 
-	edit := &discordgo.ChannelEdit{}
-
-	if params.Name != nil {
-		edit.Name = *params.Name
-	}
-	if params.Topic != nil {
-		edit.Topic = *params.Topic
-	}
-	if params.Position != nil {
-		edit.Position = params.Position
-	}
-	if params.ParentID != nil {
-		parentStr := channelIDToString(*params.ParentID)
-		edit.ParentID = parentStr
-	}
-
 	var result *Channel
 	err := c.withRetry(ctx, op, func() error {
-		ch, err := c.session.ChannelEditComplex(
-			channelIDToString(channelID),
-			edit,
-			c.requestOption(ctx)...,
-		)
-		if err != nil {
-			return wrapError(op, err)
-		}
-
-		result, err = channelFromDiscordgo(ch)
-		return err
+		var err error
+		result, err = c.backend.EditChannel(ctx, channelIDToString(channelID), params)
+		return c.normalizeError(op, err)
 	})
 
 	if err != nil {

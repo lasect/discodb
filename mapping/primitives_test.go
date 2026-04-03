@@ -8,8 +8,8 @@ import (
 
 func TestSegmentName(t *testing.T) {
 	name := SegmentName(types.TableID(1), types.SegmentID(2))
-	if name != "seg::1::2" {
-		t.Errorf("SegmentName() = %q, want %q", name, "seg::1::2")
+	if name != "seg-1-2" {
+		t.Errorf("SegmentName() = %q, want %q", name, "seg-1-2")
 	}
 }
 
@@ -21,11 +21,11 @@ func TestParseSegmentName(t *testing.T) {
 		wantSeg   types.SegmentID
 		wantErr   bool
 	}{
-		{"valid", "seg::1::2", 1, 2, false},
-		{"invalid prefix", "foo::1::2", 0, 0, true},
-		{"too few parts", "seg::1", 0, 0, true},
-		{"invalid table", "seg::abc::2", 0, 0, true},
-		{"invalid segment", "seg::1::xyz", 0, 0, true},
+		{"valid", "seg-1-2", 1, 2, false},
+		{"invalid prefix", "foo-1-2", 0, 0, true},
+		{"too few parts", "seg-1", 0, 0, true},
+		{"invalid table", "seg-abc-2", 0, 0, true},
+		{"invalid segment", "seg-1-xyz", 0, 0, true},
 	}
 
 	for _, tt := range tests {
