@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 
 	"discodb/boot"
@@ -11,9 +12,20 @@ import (
 	"discodb/config"
 	"discodb/discord"
 	"discodb/executor"
+	"discodb/mvcc"
 	discodbsql "discodb/sql"
 	"discodb/storage"
+	"discodb/txn"
 	"discodb/types"
+	"discodb/wal"
+)
+
+type ConnTxnState string
+
+const (
+	ConnTxnIdle   ConnTxnState = "idle"
+	ConnTxnActive ConnTxnState = "active"
+	ConnTxnFailed ConnTxnState = "failed"
 )
 
 type Engine struct {
@@ -28,10 +40,13 @@ type Engine struct {
 	indexClient    *discord.Client
 	overflowClient *discord.Client
 
-	walWriter      *WALWriter
-	walReader      *WALReader
-	segMgr         *SegmentManager
-	txnCounter     atomic.Uint64
+	walWriter    *WALWriter
+	walReader    *WALReader
+	segMgr       *SegmentManager
+	txnManager   *txn.Manager
+	txnMu        sync.Mutex
+	connTxnState map[string]ConnTxnState
+
 	lsnCounter     atomic.Uint64
 	rowCounter     atomic.Uint64
 	tableCounter   atomic.Uint64
@@ -86,9 +101,10 @@ func NewEngine(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 		walWriter:      walWriter,
 		walReader:      walReader,
 		segMgr:         segMgr,
+		txnManager:     txn.NewManager(),
+		connTxnState:   make(map[string]ConnTxnState),
 	}
 
-	eng.txnCounter.Store(1)
 	eng.lsnCounter.Store(1)
 	eng.rowCounter.Store(1)
 	eng.tableCounter.Store(1)
@@ -99,6 +115,22 @@ func NewEngine(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 
 func (e *Engine) Close() error {
 	return nil
+}
+
+func (e *Engine) TxnManager() *txn.Manager {
+	return e.txnManager
+}
+
+func (e *Engine) GetConnState(connID string) ConnTxnState {
+	e.txnMu.Lock()
+	defer e.txnMu.Unlock()
+	return e.connTxnState[connID]
+}
+
+func (e *Engine) SetConnState(connID string, state ConnTxnState) {
+	e.txnMu.Lock()
+	defer e.txnMu.Unlock()
+	e.connTxnState[connID] = state
 }
 
 func (e *Engine) ReadRows(ctx context.Context, tableID types.TableID) ([]storage.Row, error) {
@@ -123,25 +155,66 @@ func (e *Engine) ReadRows(ctx context.Context, tableID types.TableID) ([]storage
 	return allRows, nil
 }
 
+func (e *Engine) ReadRowsWithSnapshot(ctx context.Context, tableID types.TableID, snap mvcc.TransactionSnapshot) ([]storage.Row, error) {
+	segments, err := e.segMgr.ListSegments(ctx, tableID)
+	if err != nil {
+		return nil, fmt.Errorf("list segments: %w", err)
+	}
+
+	var allRows []storage.Row
+	for _, seg := range segments {
+		rows, _, err := e.segMgr.ReadRows(ctx, seg.ID)
+		if err != nil {
+			e.logger.Warn("failed to read rows from segment",
+				slog.String("segment", seg.Name),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+
+		for _, row := range rows {
+			if row.Header.Flags.HasTombstone() {
+				continue
+			}
+			if !snap.IsVisible(row.Header.TxnID, &row.Header.TxnMax) {
+				continue
+			}
+			allRows = append(allRows, row)
+		}
+	}
+
+	return allRows, nil
+}
+
 func (e *Engine) ExecuteQuery(query string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	return e.ExecuteQueryWithTxn("", query)
+}
+
+func (e *Engine) ExecuteQueryWithTxn(connID string, query string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
 	stmt, err := discodbsql.Parse(query)
 	if err != nil {
 		return nil, nil, 0, err
 	}
 
 	switch s := stmt.(type) {
+	case discodbsql.BeginStmt:
+		return e.handleBegin(connID)
+	case discodbsql.CommitStmt:
+		return e.handleCommit(connID)
+	case discodbsql.RollbackStmt:
+		return e.handleRollback(connID)
 	case discodbsql.CreateTableStmt:
-		return e.handleCreateTable(s)
+		return e.handleCreateTable(s, connID)
 	case discodbsql.InsertStmt:
-		return e.handleInsert(s)
+		return e.handleInsert(s, connID)
 	case discodbsql.SelectStmt:
-		return e.handleSelect(s)
+		return e.handleSelect(s, connID)
 	case discodbsql.DeleteStmt:
-		return e.handleDelete(s)
+		return e.handleDelete(s, connID)
 	case discodbsql.UpdateStmt:
-		return e.handleUpdate(s)
+		return e.handleUpdate(s, connID)
 	case discodbsql.DropTableStmt:
-		return e.handleDropTable(s)
+		return e.handleDropTable(s, connID)
 	case discodbsql.CreateIndexStmt:
 		return nil, nil, 0, fmt.Errorf("unsupported: CREATE INDEX")
 	default:
@@ -149,7 +222,252 @@ func (e *Engine) ExecuteQuery(query string) ([]executor.ColumnInfo, []executor.R
 	}
 }
 
-func (e *Engine) executePlan(plan executor.PhysicalPlan) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+func (e *Engine) handleBegin(connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	if connID == "" {
+		return nil, nil, 0, fmt.Errorf("BEGIN requires a connection ID")
+	}
+
+	e.txnMu.Lock()
+	currentState := e.connTxnState[connID]
+	e.txnMu.Unlock()
+
+	if currentState == ConnTxnActive {
+		return nil, nil, 0, fmt.Errorf("already in a transaction")
+	}
+
+	t := e.txnManager.Begin()
+
+	e.txnMu.Lock()
+	e.connTxnState[connID] = ConnTxnActive
+	e.txnMu.Unlock()
+
+	e.logger.Info("transaction began", slog.String("txn_id", t.ID.String()))
+	return nil, nil, 0, nil
+}
+
+func (e *Engine) handleCommit(connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	if connID == "" {
+		return nil, nil, 0, fmt.Errorf("COMMIT requires a connection ID")
+	}
+
+	e.txnMu.Lock()
+	currentState := e.connTxnState[connID]
+	e.txnMu.Unlock()
+
+	if currentState != ConnTxnActive {
+		return nil, nil, 0, fmt.Errorf("no active transaction to commit")
+	}
+
+	var activeTxn *txn.Transaction
+	for _, txnID := range e.txnManager.ActiveTransactions() {
+		t, ok := e.txnManager.GetTransaction(txnID)
+		if ok {
+			activeTxn = t
+			break
+		}
+	}
+
+	if activeTxn == nil {
+		e.txnMu.Lock()
+		e.connTxnState[connID] = ConnTxnIdle
+		e.txnMu.Unlock()
+		return nil, nil, 0, nil
+	}
+
+	ctx := context.Background()
+	if err := e.flushTransaction(ctx, activeTxn); err != nil {
+		_ = activeTxn.Abort()
+		e.txnMu.Lock()
+		e.connTxnState[connID] = ConnTxnFailed
+		e.txnMu.Unlock()
+		return nil, nil, 0, fmt.Errorf("commit failed: %w", err)
+	}
+
+	if err := activeTxn.Commit(); err != nil {
+		e.txnMu.Lock()
+		e.connTxnState[connID] = ConnTxnFailed
+		e.txnMu.Unlock()
+		return nil, nil, 0, fmt.Errorf("commit failed: %w", err)
+	}
+
+	e.txnManager.AdvanceTxnMin()
+
+	e.txnMu.Lock()
+	e.connTxnState[connID] = ConnTxnIdle
+	e.txnMu.Unlock()
+
+	e.logger.Info("transaction committed", slog.String("txn_id", activeTxn.ID.String()))
+	return nil, nil, 0, nil
+}
+
+func (e *Engine) handleRollback(connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	if connID == "" {
+		return nil, nil, 0, fmt.Errorf("ROLLBACK requires a connection ID")
+	}
+
+	e.txnMu.Lock()
+	currentState := e.connTxnState[connID]
+	e.txnMu.Unlock()
+
+	if currentState != ConnTxnActive && currentState != ConnTxnFailed {
+		return nil, nil, 0, fmt.Errorf("no active transaction to rollback")
+	}
+
+	var activeTxn *txn.Transaction
+	for _, txnID := range e.txnManager.ActiveTransactions() {
+		t, ok := e.txnManager.GetTransaction(txnID)
+		if ok {
+			activeTxn = t
+			break
+		}
+	}
+
+	if activeTxn != nil {
+		_ = activeTxn.Abort()
+		e.logger.Info("transaction rolled back", slog.String("txn_id", activeTxn.ID.String()))
+	}
+
+	e.txnManager.AdvanceTxnMin()
+
+	e.txnMu.Lock()
+	e.connTxnState[connID] = ConnTxnIdle
+	e.txnMu.Unlock()
+
+	return nil, nil, 0, nil
+}
+
+func (e *Engine) flushTransaction(ctx context.Context, t *txn.Transaction) error {
+	writes := t.DrainWrites()
+	if len(writes) == 0 && len(t.CatalogOps) == 0 {
+		return nil
+	}
+
+	txnID := t.ID
+	beginRec := wal.Begin(txnID, e.nextLSN())
+	if err := e.walWriter.Append(ctx, beginRec); err != nil {
+		return fmt.Errorf("WAL begin: %w", err)
+	}
+
+	for _, catOp := range t.DrainCatalogOps() {
+		catRec := wal.Record{
+			Kind:  catOp.Kind,
+			TxnID: txnID,
+			LSN:   e.nextLSN(),
+			Data:  catOp.Payload,
+		}
+		if err := e.walWriter.Append(ctx, catRec); err != nil {
+			return fmt.Errorf("WAL catalog op: %w", err)
+		}
+	}
+
+	for _, w := range writes {
+		switch w.Op {
+		case txn.WriteOpInsert:
+			msg, err := e.segMgr.WriteRow(ctx, t.ChannelID, w.Row, e.catalog.Epoch())
+			if err != nil {
+				return fmt.Errorf("write row: %w", err)
+			}
+			w.Row.Header.MessageID = msg.ID
+
+			insertRec := wal.Insert(txnID, e.nextLSN(), w.TableID, w.Row.Header.RowID, w.Row.Header.SegmentID, msg.ID, nil)
+			if err := e.walWriter.Append(ctx, insertRec); err != nil {
+				return fmt.Errorf("WAL insert: %w", err)
+			}
+
+		case txn.WriteOpUpdate:
+			tombstoneRow := w.Row
+			tombstoneRow.Header.Flags |= storage.FlagTombstone
+
+			_, err := e.segMgr.WriteRow(ctx, t.ChannelID, tombstoneRow, e.catalog.Epoch())
+			if err != nil {
+				return fmt.Errorf("write tombstone for update: %w", err)
+			}
+
+			newRow := w.Row
+			newMsg, err := e.segMgr.WriteRow(ctx, t.ChannelID, newRow, e.catalog.Epoch())
+			if err != nil {
+				return fmt.Errorf("write updated row: %w", err)
+			}
+			newRow.Header.MessageID = newMsg.ID
+
+			updateRec := wal.Update(txnID, e.nextLSN(), w.TableID, newRow.Header.RowID, newRow.Header.SegmentID, newMsg.ID, *w.OldSegID, *w.OldMsgID, nil)
+			if err := e.walWriter.Append(ctx, updateRec); err != nil {
+				return fmt.Errorf("WAL update: %w", err)
+			}
+
+		case txn.WriteOpDelete:
+			_, err := e.segMgr.WriteRow(ctx, t.ChannelID, w.Row, e.catalog.Epoch())
+			if err != nil {
+				return fmt.Errorf("write tombstone for delete: %w", err)
+			}
+
+			deleteRec := wal.Delete(txnID, e.nextLSN(), w.TableID, w.Row.Header.RowID, w.Row.Header.SegmentID, w.Row.Header.MessageID)
+			if err := e.walWriter.Append(ctx, deleteRec); err != nil {
+				return fmt.Errorf("WAL delete: %w", err)
+			}
+		}
+	}
+
+	commitRec := wal.Commit(txnID, e.nextLSN())
+	if err := e.walWriter.Append(ctx, commitRec); err != nil {
+		return fmt.Errorf("WAL commit: %w", err)
+	}
+
+	return nil
+}
+
+func (e *Engine) getOrCreateTxn(connID string) (*txn.Transaction, bool) {
+	e.txnMu.Lock()
+	state := e.connTxnState[connID]
+	e.txnMu.Unlock()
+
+	if state == ConnTxnActive {
+		for _, txnID := range e.txnManager.ActiveTransactions() {
+			t, ok := e.txnManager.GetTransaction(txnID)
+			if ok {
+				return t, true
+			}
+		}
+	}
+
+	t := e.txnManager.Begin()
+	e.txnMu.Lock()
+	e.connTxnState[connID] = ConnTxnActive
+	e.txnMu.Unlock()
+	return t, false
+}
+
+func (e *Engine) autoCommitTxn(connID string, t *txn.Transaction, wasExisting bool) error {
+	if wasExisting {
+		return nil
+	}
+
+	ctx := context.Background()
+	if err := e.flushTransaction(ctx, t); err != nil {
+		_ = t.Abort()
+		e.txnMu.Lock()
+		e.connTxnState[connID] = ConnTxnIdle
+		e.txnMu.Unlock()
+		return err
+	}
+
+	if err := t.Commit(); err != nil {
+		e.txnMu.Lock()
+		e.connTxnState[connID] = ConnTxnIdle
+		e.txnMu.Unlock()
+		return err
+	}
+
+	e.txnManager.AdvanceTxnMin()
+
+	e.txnMu.Lock()
+	e.connTxnState[connID] = ConnTxnIdle
+	e.txnMu.Unlock()
+
+	return nil
+}
+
+func (e *Engine) executePlanWithSnapshot(plan executor.PhysicalPlan, snap mvcc.TransactionSnapshot) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
 	ctx := context.Background()
 
 	var allRows []executor.Row
@@ -165,7 +483,9 @@ func (e *Engine) executePlan(plan executor.PhysicalPlan) ([]executor.ColumnInfo,
 			schema = batch.Schema
 		}
 
-		allRows = append(allRows, batch.Rows...)
+		for _, row := range batch.Rows {
+			allRows = append(allRows, row)
+		}
 
 		if done {
 			break
@@ -175,8 +495,8 @@ func (e *Engine) executePlan(plan executor.PhysicalPlan) ([]executor.ColumnInfo,
 	return schema, allRows, uint64(len(allRows)), nil
 }
 
-func (e *Engine) nextTxnID() types.TxnID {
-	return types.TxnID(e.txnCounter.Add(1))
+func (e *Engine) executePlan(plan executor.PhysicalPlan) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	return e.executePlanWithSnapshot(plan, e.txnManager.CreateSnapshot())
 }
 
 func (e *Engine) nextLSN() types.LSN {

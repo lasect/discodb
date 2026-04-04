@@ -8,16 +8,16 @@ import (
 
 	"discodb/catalog"
 	"discodb/executor"
+	"discodb/mvcc"
 	"discodb/storage"
 	"discodb/types"
-	"discodb/wal"
 
 	discodbsql "discodb/sql"
 )
 
 func ptr[T any](v T) *T { return &v }
 
-func (e *Engine) handleCreateTable(stmt discodbsql.CreateTableStmt) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+func (e *Engine) handleCreateTable(stmt discodbsql.CreateTableStmt, connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
 	tableID := e.nextTableID()
 	segmentID := e.nextSegmentID()
 
@@ -41,13 +41,7 @@ func (e *Engine) handleCreateTable(stmt discodbsql.CreateTableStmt) ([]executor.
 		return nil, nil, 0, fmt.Errorf("create segment: %w", err)
 	}
 
-	txnID := e.nextTxnID()
-	lsn := e.nextLSN()
-
-	beginRec := wal.Begin(txnID, lsn)
-	if err := e.walWriter.Append(ctx, beginRec); err != nil {
-		e.logger.Warn("WAL begin failed (non-fatal for DDL)", slog.String("error", err.Error()))
-	}
+	t, wasExisting := e.getOrCreateTxn(connID)
 
 	payload, _ := json.Marshal(map[string]interface{}{
 		"name":     stmt.Name,
@@ -55,20 +49,10 @@ func (e *Engine) handleCreateTable(stmt discodbsql.CreateTableStmt) ([]executor.
 		"columns":  stmt.Columns,
 	})
 
-	catRec := wal.Record{
-		Kind:    "CATALOG_CREATE_TABLE",
-		TxnID:   txnID,
-		LSN:     e.nextLSN(),
-		TableID: tableID,
-		Data:    payload,
-	}
-	if err := e.walWriter.Append(ctx, catRec); err != nil {
-		e.logger.Warn("WAL catalog record failed", slog.String("error", err.Error()))
-	}
+	t.BufferCatalogOp("CATALOG_CREATE_TABLE", payload)
 
-	commitRec := wal.Commit(txnID, e.nextLSN())
-	if err := e.walWriter.Append(ctx, commitRec); err != nil {
-		e.logger.Warn("WAL commit failed (non-fatal for DDL)", slog.String("error", err.Error()))
+	if err := e.autoCommitTxn(connID, t, wasExisting); err != nil {
+		return nil, nil, 0, fmt.Errorf("auto-commit: %w", err)
 	}
 
 	if err := persistCatalogToDiscord(ctx, e.catalogClient, e.boot.GuildID, e.boot.CatalogCategory, e.catalog); err != nil {
@@ -84,7 +68,7 @@ func (e *Engine) handleCreateTable(stmt discodbsql.CreateTableStmt) ([]executor.
 	return nil, nil, 0, nil
 }
 
-func (e *Engine) handleInsert(stmt discodbsql.InsertStmt) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+func (e *Engine) handleInsert(stmt discodbsql.InsertStmt, connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
 	tableSchema, ok := e.catalog.GetTableByName(stmt.Table.Name)
 	if !ok {
 		return nil, nil, 0, fmt.Errorf("table %q not found", stmt.Table.Name)
@@ -114,13 +98,10 @@ func (e *Engine) handleInsert(stmt discodbsql.InsertStmt) ([]executor.ColumnInfo
 		}
 	}
 
-	txnID := e.nextTxnID()
-	beginRec := wal.Begin(txnID, e.nextLSN())
-	if err := e.walWriter.Append(ctx, beginRec); err != nil {
-		e.logger.Warn("WAL begin failed", slog.String("error", err.Error()))
-	}
+	t, wasExisting := e.getOrCreateTxn(connID)
+	t.SetChannel(tableSchema.ID, types.SegmentID(1), segChannelID)
 
-	var insertedRows int
+	txnID := t.ID
 
 	for _, valueExprs := range stmt.Values {
 		rowID := e.nextRowID()
@@ -154,53 +135,59 @@ func (e *Engine) handleInsert(stmt discodbsql.InsertStmt) ([]executor.ColumnInfo
 			},
 		}
 
-		msg, err := e.segMgr.WriteRow(ctx, segChannelID, row, tableSchema.Epoch)
-		if err != nil {
-			return nil, nil, 0, fmt.Errorf("write row: %w", err)
-		}
-
-		row.Header.MessageID = msg.ID
-
-		insertRec := wal.Record{
-			Kind:      "INSERT",
-			TxnID:     txnID,
-			LSN:       e.nextLSN(),
-			TableID:   tableSchema.ID,
-			RowID:     rowID,
-			SegmentID: types.SegmentID(1),
-			MessageID: msg.ID,
-			Data:      nil,
-		}
-		if err := e.walWriter.Append(ctx, insertRec); err != nil {
-			e.logger.Warn("WAL insert failed", slog.String("error", err.Error()))
-		}
-
-		insertedRows++
+		t.BufferInsert(tableSchema.ID, row)
 	}
 
-	commitRec := wal.Commit(txnID, e.nextLSN())
-	if err := e.walWriter.Append(ctx, commitRec); err != nil {
-		e.logger.Warn("WAL commit failed", slog.String("error", err.Error()))
+	if err := e.autoCommitTxn(connID, t, wasExisting); err != nil {
+		return nil, nil, 0, fmt.Errorf("auto-commit: %w", err)
 	}
 
 	e.logger.Info("rows inserted",
 		slog.String("table", stmt.Table.Name),
-		slog.Int("count", insertedRows),
+		slog.Int("count", len(stmt.Values)),
 	)
 
-	return nil, nil, uint64(insertedRows), nil
+	return nil, nil, uint64(len(stmt.Values)), nil
 }
 
-func (e *Engine) handleSelect(stmt discodbsql.SelectStmt) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+func (e *Engine) handleSelect(stmt discodbsql.SelectStmt, connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	var snap mvcc.TransactionSnapshot
+
+	if connID != "" {
+		e.txnMu.Lock()
+		state := e.connTxnState[connID]
+		e.txnMu.Unlock()
+
+		if state == ConnTxnActive {
+			for _, txnID := range e.txnManager.ActiveTransactions() {
+				t, ok := e.txnManager.GetTransaction(txnID)
+				if ok {
+					snap = t.Snapshot
+					break
+				}
+			}
+		}
+	}
+
+	if snap.TxnID == 0 {
+		snap = e.txnManager.CreateSnapshot()
+	}
+
 	planner := discodbsql.NewPlanner(e.catalog, e)
 	plan, err := planner.Plan(stmt)
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	return e.executePlan(plan)
+
+	schema, rows, count, err := e.executePlanWithSnapshot(plan, snap)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	return schema, rows, count, nil
 }
 
-func (e *Engine) handleDelete(stmt discodbsql.DeleteStmt) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+func (e *Engine) handleDelete(stmt discodbsql.DeleteStmt, connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
 	planner := discodbsql.NewPlanner(e.catalog, e)
 	plan, err := planner.Plan(stmt)
 	if err != nil {
@@ -228,14 +215,11 @@ func (e *Engine) handleDelete(stmt discodbsql.DeleteStmt) ([]executor.ColumnInfo
 	}
 
 	segChannelID := segments[0].ID
-	txnID := e.nextTxnID()
+	t, wasExisting := e.getOrCreateTxn(connID)
+	t.SetChannel(tableSchema.ID, types.SegmentID(1), segChannelID)
 
-	beginRec := wal.Begin(txnID, e.nextLSN())
-	if err := e.walWriter.Append(ctx, beginRec); err != nil {
-		e.logger.Warn("WAL begin failed", slog.String("error", err.Error()))
-	}
+	txnID := t.ID
 
-	var deleted int
 	for _, row := range rows {
 		if len(row.Values) < len(tableSchema.Columns) {
 			continue
@@ -264,31 +248,18 @@ func (e *Engine) handleDelete(stmt discodbsql.DeleteStmt) ([]executor.ColumnInfo
 			},
 		}
 
-		msg, err := e.segMgr.WriteRow(ctx, segChannelID, tombstoneRow, tableSchema.Epoch)
-		if err != nil {
-			return nil, nil, 0, fmt.Errorf("write tombstone: %w", err)
-		}
-
-		delRec := wal.Record{
-			Kind:      "DELETE",
-			TxnID:     txnID,
-			LSN:       e.nextLSN(),
-			TableID:   tableSchema.ID,
-			RowID:     tombstoneRow.Header.RowID,
-			SegmentID: types.SegmentID(1),
-			MessageID: msg.ID,
-			Data:      nil,
-		}
-		if err := e.walWriter.Append(ctx, delRec); err != nil {
-			e.logger.Warn("WAL delete record failed", slog.String("error", err.Error()))
-		}
-
-		deleted++
+		t.BufferDelete(tableSchema.ID, tombstoneRow)
 	}
 
-	commitRec := wal.Commit(txnID, e.nextLSN())
-	if err := e.walWriter.Append(ctx, commitRec); err != nil {
-		e.logger.Warn("WAL commit failed", slog.String("error", err.Error()))
+	var deleted int
+	for _, row := range rows {
+		if len(row.Values) >= len(tableSchema.Columns) {
+			deleted++
+		}
+	}
+
+	if err := e.autoCommitTxn(connID, t, wasExisting); err != nil {
+		return nil, nil, 0, fmt.Errorf("auto-commit: %w", err)
 	}
 
 	e.logger.Info("rows deleted",
@@ -299,7 +270,7 @@ func (e *Engine) handleDelete(stmt discodbsql.DeleteStmt) ([]executor.ColumnInfo
 	return nil, nil, uint64(deleted), nil
 }
 
-func (e *Engine) handleUpdate(stmt discodbsql.UpdateStmt) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+func (e *Engine) handleUpdate(stmt discodbsql.UpdateStmt, connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
 	planner := discodbsql.NewPlanner(e.catalog, e)
 	plan, err := planner.Plan(stmt)
 	if err != nil {
@@ -327,12 +298,10 @@ func (e *Engine) handleUpdate(stmt discodbsql.UpdateStmt) ([]executor.ColumnInfo
 	}
 
 	segChannelID := segments[0].ID
-	txnID := e.nextTxnID()
+	t, wasExisting := e.getOrCreateTxn(connID)
+	t.SetChannel(tableSchema.ID, types.SegmentID(1), segChannelID)
 
-	beginRec := wal.Begin(txnID, e.nextLSN())
-	if err := e.walWriter.Append(ctx, beginRec); err != nil {
-		e.logger.Warn("WAL begin failed", slog.String("error", err.Error()))
-	}
+	txnID := t.ID
 
 	var updated int
 	for _, row := range rows {
@@ -343,7 +312,7 @@ func (e *Engine) handleUpdate(stmt discodbsql.UpdateStmt) ([]executor.ColumnInfo
 		newValues := make([]types.Value, len(tableSchema.Columns))
 		copy(newValues, row.Values)
 
-		for i, setCol := range stmt.Set {
+		for _, setCol := range stmt.Set {
 			colIdx, ok := tableSchema.ColumnIndex(setCol.Column)
 			if !ok {
 				continue
@@ -351,34 +320,6 @@ func (e *Engine) handleUpdate(stmt discodbsql.UpdateStmt) ([]executor.ColumnInfo
 			if setCol.Value.Constant != nil && setCol.Value.Constant.Value.Valid {
 				newValues[colIdx] = setCol.Value.Constant.Value
 			}
-			_ = i
-		}
-
-		var colValues []storage.ColumnValue
-		for i, val := range newValues {
-			if i >= len(tableSchema.Columns) {
-				break
-			}
-			colValues = append(colValues, valueToColumnValue(val, tableSchema.Columns[i].DataType))
-		}
-
-		tombstoneRow := storage.Row{
-			Header: storage.RowHeader{
-				RowID:     e.nextRowID(),
-				TableID:   tableSchema.ID,
-				SegmentID: types.SegmentID(1),
-				MessageID: types.MessageID(0),
-				TxnID:     txnID,
-				LSN:       e.nextLSN(),
-				Flags:     storage.FlagTombstone,
-			},
-			Body: storage.RowBody{
-				Columns: colValues,
-			},
-		}
-
-		if _, err := e.segMgr.WriteRow(ctx, segChannelID, tombstoneRow, tableSchema.Epoch); err != nil {
-			return nil, nil, 0, fmt.Errorf("write tombstone for update: %w", err)
 		}
 
 		var newColValues []storage.ColumnValue
@@ -404,31 +345,12 @@ func (e *Engine) handleUpdate(stmt discodbsql.UpdateStmt) ([]executor.ColumnInfo
 			},
 		}
 
-		msg, err := e.segMgr.WriteRow(ctx, segChannelID, newRow, tableSchema.Epoch)
-		if err != nil {
-			return nil, nil, 0, fmt.Errorf("write updated row: %w", err)
-		}
-
-		updateRec := wal.Record{
-			Kind:      "UPDATE",
-			TxnID:     txnID,
-			LSN:       e.nextLSN(),
-			TableID:   tableSchema.ID,
-			RowID:     newRow.Header.RowID,
-			SegmentID: types.SegmentID(1),
-			MessageID: msg.ID,
-			Data:      nil,
-		}
-		if err := e.walWriter.Append(ctx, updateRec); err != nil {
-			e.logger.Warn("WAL update record failed", slog.String("error", err.Error()))
-		}
-
+		t.BufferInsert(tableSchema.ID, newRow)
 		updated++
 	}
 
-	commitRec := wal.Commit(txnID, e.nextLSN())
-	if err := e.walWriter.Append(ctx, commitRec); err != nil {
-		e.logger.Warn("WAL commit failed", slog.String("error", err.Error()))
+	if err := e.autoCommitTxn(connID, t, wasExisting); err != nil {
+		return nil, nil, 0, fmt.Errorf("auto-commit: %w", err)
 	}
 
 	e.logger.Info("rows updated",
@@ -439,7 +361,7 @@ func (e *Engine) handleUpdate(stmt discodbsql.UpdateStmt) ([]executor.ColumnInfo
 	return nil, nil, uint64(updated), nil
 }
 
-func (e *Engine) handleDropTable(stmt discodbsql.DropTableStmt) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+func (e *Engine) handleDropTable(stmt discodbsql.DropTableStmt, connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
 	tableSchema, ok := e.catalog.GetTableByName(stmt.Name)
 	if !ok {
 		return nil, nil, 0, fmt.Errorf("table %q not found", stmt.Name)
@@ -452,21 +374,18 @@ func (e *Engine) handleDropTable(stmt discodbsql.DropTableStmt) ([]executor.Colu
 		return nil, nil, 0, fmt.Errorf("list segments: %w", err)
 	}
 
-	txnID := e.nextTxnID()
-
-	beginRec := wal.Begin(txnID, e.nextLSN())
-	if err := e.walWriter.Append(ctx, beginRec); err != nil {
-		e.logger.Warn("WAL begin failed", slog.String("error", err.Error()))
-	}
+	t, wasExisting := e.getOrCreateTxn(connID)
 
 	if len(segments) > 0 {
 		segChannelID := segments[0].ID
+		t.SetChannel(tableSchema.ID, types.SegmentID(1), segChannelID)
 
 		allRows, _, err := e.segMgr.ReadRows(ctx, segChannelID)
 		if err != nil {
 			e.logger.Warn("failed to read rows for drop", slog.String("error", err.Error()))
 		}
 
+		txnID := t.ID
 		for _, row := range allRows {
 			if row.Header.Flags.HasTombstone() {
 				continue
@@ -485,9 +404,7 @@ func (e *Engine) handleDropTable(stmt discodbsql.DropTableStmt) ([]executor.Colu
 				Body: row.Body,
 			}
 
-			if _, err := e.segMgr.WriteRow(ctx, segChannelID, tombstoneRow, tableSchema.Epoch); err != nil {
-				e.logger.Warn("failed to write tombstone during drop", slog.String("error", err.Error()))
-			}
+			t.BufferDelete(tableSchema.ID, tombstoneRow)
 		}
 	}
 
@@ -496,20 +413,10 @@ func (e *Engine) handleDropTable(stmt discodbsql.DropTableStmt) ([]executor.Colu
 		"table_id": tableSchema.ID.Uint64(),
 	})
 
-	catRec := wal.Record{
-		Kind:    "CATALOG_DROP_TABLE",
-		TxnID:   txnID,
-		LSN:     e.nextLSN(),
-		TableID: tableSchema.ID,
-		Data:    payload,
-	}
-	if err := e.walWriter.Append(ctx, catRec); err != nil {
-		e.logger.Warn("WAL catalog drop record failed", slog.String("error", err.Error()))
-	}
+	t.BufferCatalogOp("CATALOG_DROP_TABLE", payload)
 
-	commitRec := wal.Commit(txnID, e.nextLSN())
-	if err := e.walWriter.Append(ctx, commitRec); err != nil {
-		e.logger.Warn("WAL commit failed", slog.String("error", err.Error()))
+	if err := e.autoCommitTxn(connID, t, wasExisting); err != nil {
+		return nil, nil, 0, fmt.Errorf("auto-commit: %w", err)
 	}
 
 	e.catalog.RemoveTable(tableSchema.ID)

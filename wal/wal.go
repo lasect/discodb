@@ -45,8 +45,28 @@ func Begin(txnID types.TxnID, lsn types.LSN) Record {
 	return Record{Kind: "BEGIN", TxnID: txnID, LSN: lsn}
 }
 
+func Prepare(txnID types.TxnID, lsn types.LSN) Record {
+	return Record{Kind: "PREPARE", TxnID: txnID, LSN: lsn}
+}
+
 func Commit(txnID types.TxnID, lsn types.LSN) Record {
 	return Record{Kind: "COMMIT", TxnID: txnID, LSN: lsn}
+}
+
+func Abort(txnID types.TxnID, lsn types.LSN) Record {
+	return Record{Kind: "ABORT", TxnID: txnID, LSN: lsn}
+}
+
+func Insert(txnID types.TxnID, lsn types.LSN, tableID types.TableID, rowID types.RowID, segmentID types.SegmentID, messageID types.MessageID, data []byte) Record {
+	return Record{Kind: "INSERT", TxnID: txnID, LSN: lsn, TableID: tableID, RowID: rowID, SegmentID: segmentID, MessageID: messageID, Data: data}
+}
+
+func Update(txnID types.TxnID, lsn types.LSN, tableID types.TableID, rowID types.RowID, segmentID types.SegmentID, messageID types.MessageID, oldSegmentID types.SegmentID, oldMessageID types.MessageID, data []byte) Record {
+	return Record{Kind: "UPDATE", TxnID: txnID, LSN: lsn, TableID: tableID, RowID: rowID, SegmentID: segmentID, MessageID: messageID, OldSegmentID: oldSegmentID, OldMessageID: oldMessageID, Data: data}
+}
+
+func Delete(txnID types.TxnID, lsn types.LSN, tableID types.TableID, rowID types.RowID, segmentID types.SegmentID, messageID types.MessageID) Record {
+	return Record{Kind: "DELETE", TxnID: txnID, LSN: lsn, TableID: tableID, RowID: rowID, SegmentID: segmentID, MessageID: messageID}
 }
 
 type Writer struct {

@@ -102,20 +102,23 @@ func (s *Server) ListenAndServe() error {
 
 	s.logger.Info("wire server listening", slog.String("addr", s.addr))
 
+	connCounter := uint64(0)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return err
 		}
+		connCounter++
+		connID := fmt.Sprintf("conn-%d", connCounter)
 		go func() {
-			if err := s.handleConnection(context.Background(), conn); err != nil {
-				s.logger.Error("connection failed", slog.String("error", err.Error()))
+			if err := s.handleConnection(context.Background(), conn, connID); err != nil {
+				s.logger.Error("connection failed", slog.String("conn_id", connID), slog.String("error", err.Error()))
 			}
 		}()
 	}
 }
 
-func (s *Server) handleConnection(ctx context.Context, conn net.Conn) error {
+func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID string) error {
 	defer conn.Close()
 
 	if err := handleSSLNegotiation(conn); err != nil {
@@ -127,6 +130,9 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) error {
 	if _, err := conn.Write(serializeAuthenticationOK()); err != nil {
 		return err
 	}
+
+	s.engine.SetConnState(connID, engine.ConnTxnIdle)
+
 	if _, err := conn.Write(serializeReadyForQuery(QueryStatusIdle)); err != nil {
 		return err
 	}
@@ -155,10 +161,9 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn) error {
 		switch msgType[0] {
 		case 'Q':
 			query := string(bytes.TrimRight(payload, "\x00"))
-			if err := s.executeQuery(ctx, conn, query); err != nil {
-				return err
-			}
-			if _, err := conn.Write(serializeReadyForQuery(QueryStatusIdle)); err != nil {
+			queryErr := s.executeQuery(ctx, conn, connID, query)
+			status := s.connStatus(connID, queryErr != nil)
+			if _, err := conn.Write(serializeReadyForQuery(status)); err != nil {
 				return err
 			}
 		case 'X':
@@ -205,18 +210,15 @@ func readStartup(conn net.Conn) error {
 	return err
 }
 
-func (s *Server) executeQuery(ctx context.Context, conn net.Conn, query string) error {
+func (s *Server) executeQuery(ctx context.Context, conn net.Conn, connID string, query string) error {
 	_ = ctx
 
 	query = strings.TrimSpace(query)
 	if query == "" || query == ";" {
-		if _, err := conn.Write(serializeReadyForQuery(QueryStatusIdle)); err != nil {
-			return err
-		}
 		return nil
 	}
 
-	cols, rows, affectedRows, err := s.engine.ExecuteQuery(query)
+	cols, rows, affectedRows, err := s.engine.ExecuteQueryWithTxn(connID, query)
 	if err != nil {
 		_, writeErr := conn.Write(serializeErrorResponse(InternalError(err.Error())))
 		return writeErr
@@ -260,6 +262,17 @@ func (s *Server) executeQuery(ctx context.Context, conn net.Conn, query string) 
 	}
 
 	return nil
+}
+
+func (s *Server) connStatus(connID string, hadError bool) QueryStatus {
+	state := s.engine.GetConnState(connID)
+	if hadError || state == engine.ConnTxnFailed {
+		return QueryStatusFailed
+	}
+	if state == engine.ConnTxnActive {
+		return QueryStatusTransactionBlock
+	}
+	return QueryStatusIdle
 }
 
 func determineCommandTag(query string, rowCount uint64) CommandTag {

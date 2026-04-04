@@ -71,6 +71,18 @@ type CreateIndexStmt struct {
 
 func (CreateIndexStmt) statement() {}
 
+type BeginStmt struct{}
+
+func (BeginStmt) statement() {}
+
+type CommitStmt struct{}
+
+func (CommitStmt) statement() {}
+
+type RollbackStmt struct{}
+
+func (RollbackStmt) statement() {}
+
 type SelectColumn struct {
 	All   bool
 	Name  string
@@ -306,7 +318,8 @@ func isKeyword(word string) bool {
 		"GROUP", "HAVING", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS",
 		"INT2", "INT4", "INT8", "FLOAT4", "FLOAT8", "TEXT", "JSON", "BLOB", "BOOL", "TIMESTAMP", "DATE",
 		"COUNT", "SUM", "AVG", "MIN", "MAX",
-		"TRUE", "FALSE":
+		"TRUE", "FALSE",
+		"BEGIN", "COMMIT", "ROLLBACK", "TRANSACTION", "ABORT", "END":
 		return true
 	}
 	return false
@@ -361,8 +374,14 @@ func (p *Parser) Parse() (Statement, error) {
 		return p.parseUpdate()
 	case "DROP":
 		return p.parseDrop()
+	case "BEGIN":
+		return p.parseBegin()
+	case "COMMIT", "END":
+		return p.parseCommit()
+	case "ROLLBACK", "ABORT":
+		return p.parseRollback()
 	default:
-		return nil, fmt.Errorf("unsupported: %q (discodb supports SELECT, INSERT, CREATE TABLE, UPDATE, DELETE, DROP TABLE)", p.cur.Val)
+		return nil, fmt.Errorf("unsupported: %q (discodb supports SELECT, INSERT, CREATE TABLE, UPDATE, DELETE, DROP TABLE, BEGIN, COMMIT, ROLLBACK)", p.cur.Val)
 	}
 }
 
@@ -718,6 +737,30 @@ func (p *Parser) parseDrop() (Statement, error) {
 	p.advance()
 
 	return DropTableStmt{Name: tableName}, nil
+}
+
+func (p *Parser) parseBegin() (Statement, error) {
+	p.advance()
+	if p.cur.Kind == TokKeyword && p.cur.Val == "TRANSACTION" {
+		p.advance()
+	}
+	return BeginStmt{}, nil
+}
+
+func (p *Parser) parseCommit() (Statement, error) {
+	p.advance()
+	if p.cur.Kind == TokKeyword && p.cur.Val == "TRANSACTION" {
+		p.advance()
+	}
+	return CommitStmt{}, nil
+}
+
+func (p *Parser) parseRollback() (Statement, error) {
+	p.advance()
+	if p.cur.Kind == TokKeyword && p.cur.Val == "TRANSACTION" {
+		p.advance()
+	}
+	return RollbackStmt{}, nil
 }
 
 func (p *Parser) parseDataType() (SQLDataType, error) {

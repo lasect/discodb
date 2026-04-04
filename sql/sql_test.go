@@ -381,3 +381,45 @@ func TestPlannerDeleteNoWhere(t *testing.T) {
 		t.Fatalf("expected SeqScan under DeleteExec (no filter), got %T", del.Input)
 	}
 }
+
+func TestParseTransactionControl(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		want  Statement
+	}{
+		{"BEGIN", "BEGIN", BeginStmt{}},
+		{"BEGIN TRANSACTION", "BEGIN TRANSACTION", BeginStmt{}},
+		{"COMMIT", "COMMIT", CommitStmt{}},
+		{"COMMIT TRANSACTION", "COMMIT TRANSACTION", CommitStmt{}},
+		{"END", "END", CommitStmt{}},
+		{"ROLLBACK", "ROLLBACK", RollbackStmt{}},
+		{"ROLLBACK TRANSACTION", "ROLLBACK TRANSACTION", RollbackStmt{}},
+		{"ABORT", "ABORT", RollbackStmt{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stmt, err := Parse(tt.query)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			switch expected := tt.want.(type) {
+			case BeginStmt:
+				if _, ok := stmt.(BeginStmt); !ok {
+					t.Fatalf("expected BeginStmt, got %T", stmt)
+				}
+			case CommitStmt:
+				if _, ok := stmt.(CommitStmt); !ok {
+					t.Fatalf("expected CommitStmt, got %T", stmt)
+				}
+			case RollbackStmt:
+				if _, ok := stmt.(RollbackStmt); !ok {
+					t.Fatalf("expected RollbackStmt, got %T", stmt)
+				}
+			default:
+				_ = expected
+			}
+		})
+	}
+}
