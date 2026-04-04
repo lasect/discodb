@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode"
 
+	"discodb/catalog"
 	"discodb/executor"
 	"discodb/types"
 )
@@ -355,13 +356,13 @@ func (p *Parser) Parse() (Statement, error) {
 	case "CREATE":
 		return p.parseCreate()
 	case "DELETE":
-		return nil, fmt.Errorf("unsupported: DELETE")
+		return p.parseDelete()
 	case "UPDATE":
-		return nil, fmt.Errorf("unsupported: UPDATE")
+		return p.parseUpdate()
 	case "DROP":
-		return nil, fmt.Errorf("unsupported: DROP TABLE")
+		return p.parseDrop()
 	default:
-		return nil, fmt.Errorf("unsupported: %q (discodb supports SELECT, INSERT, CREATE TABLE)", p.cur.Val)
+		return nil, fmt.Errorf("unsupported: %q (discodb supports SELECT, INSERT, CREATE TABLE, UPDATE, DELETE, DROP TABLE)", p.cur.Val)
 	}
 }
 
@@ -619,6 +620,106 @@ func (p *Parser) parseCreate() (Statement, error) {
 	}, nil
 }
 
+func (p *Parser) parseDelete() (Statement, error) {
+	if err := p.expectKeyword("DELETE"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("FROM"); err != nil {
+		return nil, err
+	}
+
+	tableName := p.cur.Val
+	if p.cur.Kind != TokIdent {
+		return nil, fmt.Errorf("expected table name, got %q", p.cur.Val)
+	}
+	p.advance()
+
+	stmt := DeleteStmt{Table: TableRef{Name: tableName}}
+
+	if p.cur.Kind == TokKeyword && p.cur.Val == "WHERE" {
+		p.advance()
+		pred, err := p.parsePredicate()
+		if err != nil {
+			return nil, err
+		}
+		stmt.WhereClause = pred
+	}
+
+	return stmt, nil
+}
+
+func (p *Parser) parseUpdate() (Statement, error) {
+	if err := p.expectKeyword("UPDATE"); err != nil {
+		return nil, err
+	}
+
+	tableName := p.cur.Val
+	if p.cur.Kind != TokIdent {
+		return nil, fmt.Errorf("expected table name, got %q", p.cur.Val)
+	}
+	p.advance()
+
+	if err := p.expectKeyword("SET"); err != nil {
+		return nil, err
+	}
+
+	var setClauses []SetClause
+	for {
+		colName := p.cur.Val
+		if p.cur.Kind != TokIdent {
+			return nil, fmt.Errorf("expected column name, got %q", p.cur.Val)
+		}
+		p.advance()
+
+		if err := p.expectSymbol("="); err != nil {
+			return nil, err
+		}
+
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+
+		setClauses = append(setClauses, SetClause{Column: colName, Value: expr})
+
+		if p.cur.Kind == TokSymbol && p.cur.Val == "," {
+			p.advance()
+		} else {
+			break
+		}
+	}
+
+	stmt := UpdateStmt{Table: TableRef{Name: tableName}, Set: setClauses}
+
+	if p.cur.Kind == TokKeyword && p.cur.Val == "WHERE" {
+		p.advance()
+		pred, err := p.parsePredicate()
+		if err != nil {
+			return nil, err
+		}
+		stmt.WhereClause = pred
+	}
+
+	return stmt, nil
+}
+
+func (p *Parser) parseDrop() (Statement, error) {
+	if err := p.expectKeyword("DROP"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("TABLE"); err != nil {
+		return nil, err
+	}
+
+	tableName := p.cur.Val
+	if p.cur.Kind != TokIdent {
+		return nil, fmt.Errorf("expected table name, got %q", p.cur.Val)
+	}
+	p.advance()
+
+	return DropTableStmt{Name: tableName}, nil
+}
+
 func (p *Parser) parseDataType() (SQLDataType, error) {
 	if p.cur.Kind != TokKeyword {
 		return "", fmt.Errorf("expected data type, got %q", p.cur.Val)
@@ -740,19 +841,314 @@ func Parse(query string) (Statement, error) {
 	return p.Parse()
 }
 
-type Planner struct{}
-
-func NewPlanner() Planner {
-	return Planner{}
+type Planner struct {
+	catalog *catalog.Catalog
+	reader  executor.StorageReader
 }
 
-func (Planner) Plan(stmt Statement) (executor.PhysicalPlan, error) {
-	switch stmt.(type) {
+func NewPlanner(cat *catalog.Catalog, reader executor.StorageReader) Planner {
+	return Planner{catalog: cat, reader: reader}
+}
+
+func (p Planner) Plan(stmt Statement) (executor.PhysicalPlan, error) {
+	switch s := stmt.(type) {
 	case SelectStmt:
-		return executor.PhysicalPlan{
-			Root: executor.NewSeqScan(types.MinTableID(), nil, nil),
-		}, nil
+		return p.planSelect(s)
+	case InsertStmt:
+		return p.planInsert(s)
+	case DeleteStmt:
+		return p.planDelete(s)
+	case UpdateStmt:
+		return p.planUpdate(s)
 	default:
-		return executor.PhysicalPlan{}, fmt.Errorf("unsupported: only SELECT is supported")
+		return executor.PhysicalPlan{}, fmt.Errorf("unsupported statement")
+	}
+}
+
+func (p Planner) planSelect(stmt SelectStmt) (executor.PhysicalPlan, error) {
+	if stmt.From == nil {
+		return executor.PhysicalPlan{}, fmt.Errorf("SELECT requires a FROM clause")
+	}
+
+	tableSchema, ok := p.catalog.GetTableByName(stmt.From.Name)
+	if !ok {
+		return executor.PhysicalPlan{}, fmt.Errorf("table %q not found", stmt.From.Name)
+	}
+
+	var fullSchema []executor.ColumnInfo
+	for i, col := range tableSchema.Columns {
+		fullSchema = append(fullSchema, executor.ColumnInfo{
+			Name:    col.Name,
+			TableID: &tableSchema.ID,
+			Ordinal: i,
+		})
+	}
+
+	var scanFilter *executor.Predicate
+	var filterPred *executor.Predicate
+
+	if stmt.WhereClause != nil {
+		scanFilter, filterPred = p.splitPredicate(stmt.WhereClause, &tableSchema)
+	}
+
+	var root executor.Executor
+	root = executor.NewSeqScan(p.reader, tableSchema.ID, scanFilter, fullSchema)
+
+	if filterPred != nil {
+		root = &executor.Filter{Input: root, Predicate: *filterPred}
+	}
+
+	isStar := len(stmt.Columns) == 1 && stmt.Columns[0].All
+
+	if !isStar {
+		var colIdxs []int
+		var projSchema []executor.ColumnInfo
+		for _, selCol := range stmt.Columns {
+			if selCol.Name != "" {
+				idx, ok := tableSchema.ColumnIndex(selCol.Name)
+				if ok {
+					colIdxs = append(colIdxs, idx)
+					name := selCol.Alias
+					if name == "" {
+						name = selCol.Name
+					}
+					projSchema = append(projSchema, executor.ColumnInfo{Name: name, Ordinal: len(projSchema)})
+				} else {
+					return executor.PhysicalPlan{}, fmt.Errorf("column %q not found", selCol.Name)
+				}
+			}
+		}
+		if len(colIdxs) > 0 {
+			root = &executor.Projection{Input: root, Columns: colIdxs, Schema: projSchema}
+		}
+	}
+
+	if stmt.Limit != nil {
+		offset := 0
+		if stmt.Offset != nil {
+			offset = *stmt.Offset
+		}
+		root = &executor.Limit{Input: root, Remaining: *stmt.Limit, Offset: offset}
+	}
+
+	return executor.PhysicalPlan{Root: root}, nil
+}
+
+func (p Planner) planInsert(stmt InsertStmt) (executor.PhysicalPlan, error) {
+	tableSchema, ok := p.catalog.GetTableByName(stmt.Table.Name)
+	if !ok {
+		return executor.PhysicalPlan{}, fmt.Errorf("table %q not found", stmt.Table.Name)
+	}
+
+	var schema []executor.ColumnInfo
+	for i, col := range tableSchema.Columns {
+		schema = append(schema, executor.ColumnInfo{Name: col.Name, Ordinal: i})
+	}
+
+	var rows []executor.Row
+	for _, valueExprs := range stmt.Values {
+		var vals []types.Value
+		for _, expr := range valueExprs {
+			if expr.Constant != nil {
+				vals = append(vals, expr.Constant.Value)
+			} else {
+				vals = append(vals, types.NullValue())
+			}
+		}
+		rows = append(rows, executor.Row{Values: vals})
+	}
+
+	return executor.PhysicalPlan{Root: executor.NewValues(rows, schema)}, nil
+}
+
+func (p Planner) planDelete(stmt DeleteStmt) (executor.PhysicalPlan, error) {
+	tableSchema, ok := p.catalog.GetTableByName(stmt.Table.Name)
+	if !ok {
+		return executor.PhysicalPlan{}, fmt.Errorf("table %q not found", stmt.Table.Name)
+	}
+
+	var fullSchema []executor.ColumnInfo
+	for i, col := range tableSchema.Columns {
+		fullSchema = append(fullSchema, executor.ColumnInfo{
+			Name:    col.Name,
+			TableID: &tableSchema.ID,
+			Ordinal: i,
+		})
+	}
+
+	var scanFilter *executor.Predicate
+	var filterPred *executor.Predicate
+
+	if stmt.WhereClause != nil {
+		scanFilter, filterPred = p.splitPredicate(stmt.WhereClause, &tableSchema)
+	}
+
+	var root executor.Executor
+	root = executor.NewSeqScan(p.reader, tableSchema.ID, scanFilter, fullSchema)
+
+	if filterPred != nil {
+		root = &executor.Filter{Input: root, Predicate: *filterPred}
+	}
+
+	root = &executor.DeleteExec{Input: root, TableID: tableSchema.ID}
+
+	return executor.PhysicalPlan{Root: root}, nil
+}
+
+func (p Planner) planUpdate(stmt UpdateStmt) (executor.PhysicalPlan, error) {
+	tableSchema, ok := p.catalog.GetTableByName(stmt.Table.Name)
+	if !ok {
+		return executor.PhysicalPlan{}, fmt.Errorf("table %q not found", stmt.Table.Name)
+	}
+
+	var fullSchema []executor.ColumnInfo
+	for i, col := range tableSchema.Columns {
+		fullSchema = append(fullSchema, executor.ColumnInfo{
+			Name:    col.Name,
+			TableID: &tableSchema.ID,
+			Ordinal: i,
+		})
+	}
+
+	var scanFilter *executor.Predicate
+	var filterPred *executor.Predicate
+
+	if stmt.WhereClause != nil {
+		scanFilter, filterPred = p.splitPredicate(stmt.WhereClause, &tableSchema)
+	}
+
+	var root executor.Executor
+	root = executor.NewSeqScan(p.reader, tableSchema.ID, scanFilter, fullSchema)
+
+	if filterPred != nil {
+		root = &executor.Filter{Input: root, Predicate: *filterPred}
+	}
+
+	var setCols []string
+	var setExprs []executor.Expression
+	for _, sc := range stmt.Set {
+		setCols = append(setCols, sc.Column)
+		setExprs = append(setExprs, setClauseToExpression(sc, &tableSchema))
+	}
+
+	root = &executor.UpdateExec{Input: root, TableID: tableSchema.ID, SetCols: setCols, SetExprs: setExprs}
+
+	return executor.PhysicalPlan{Root: root}, nil
+}
+
+func setClauseToExpression(sc SetClause, schema *catalog.TableSchema) executor.Expression {
+	if sc.Value.Constant != nil {
+		return executor.Expression{Constant: &sc.Value.Constant.Value}
+	}
+	if sc.Value.Column != "" {
+		if idx, ok := schema.ColumnIndex(sc.Value.Column); ok {
+			return executor.Expression{ColumnIndex: &idx}
+		}
+	}
+	return executor.Expression{}
+}
+
+func (p Planner) splitPredicate(pred *Predicate, schema *catalog.TableSchema) (scanFilter *executor.Predicate, remaining *executor.Predicate) {
+	if pred == nil {
+		return nil, nil
+	}
+
+	if pred.Comparison != nil {
+		execPred := buildPredicate(pred, schema)
+		if isPushdownable(pred.Comparison) {
+			return &execPred, nil
+		}
+		return nil, &execPred
+	}
+
+	if pred.Logical != nil {
+		leftScan, leftRem := p.splitPredicate(pred.Logical.Left, schema)
+		rightScan, rightRem := p.splitPredicate(pred.Logical.Right, schema)
+
+		var combinedScan *executor.Predicate
+		if leftScan != nil && rightScan != nil {
+			combinedScan = &executor.Predicate{
+				LeftPred:  leftScan,
+				RightPred: rightScan,
+				LogicalOp: executor.ComparisonOp(pred.Logical.Op),
+				Op:        executor.ComparisonOp(pred.Logical.Op),
+			}
+		} else if leftScan != nil {
+			combinedScan = leftScan
+		} else if rightScan != nil {
+			combinedScan = rightScan
+		}
+
+		var combinedRem *executor.Predicate
+		if leftRem != nil && rightRem != nil {
+			combinedRem = &executor.Predicate{
+				LeftPred:  leftRem,
+				RightPred: rightRem,
+				LogicalOp: executor.ComparisonOp(pred.Logical.Op),
+				Op:        executor.ComparisonOp(pred.Logical.Op),
+			}
+		} else if leftRem != nil {
+			combinedRem = leftRem
+		} else if rightRem != nil {
+			combinedRem = rightRem
+		}
+
+		return combinedScan, combinedRem
+	}
+
+	return nil, nil
+}
+
+func isPushdownable(comp *Comparison) bool {
+	if comp.Left.Column == "" {
+		return false
+	}
+	switch comp.Op {
+	case CompEq, CompNe, CompLt, CompLe, CompGt, CompGe:
+		return comp.Right.Constant != nil
+	default:
+		return false
+	}
+}
+
+func buildPredicate(pred *Predicate, schema *catalog.TableSchema) executor.Predicate {
+	if pred == nil || pred.Comparison == nil {
+		return executor.Predicate{}
+	}
+
+	leftIdx := -1
+	if pred.Comparison.Left.Column != "" {
+		if idx, ok := schema.ColumnIndex(pred.Comparison.Left.Column); ok {
+			leftIdx = idx
+		}
+	}
+
+	rightIdx := -1
+	if pred.Comparison.Right.Column != "" {
+		if idx, ok := schema.ColumnIndex(pred.Comparison.Right.Column); ok {
+			rightIdx = idx
+		}
+	}
+
+	var leftExpr, rightExpr executor.Expression
+
+	if leftIdx >= 0 {
+		leftExpr = executor.Expression{ColumnIndex: &leftIdx}
+	} else if pred.Comparison.Left.Constant != nil {
+		v := pred.Comparison.Left.Constant.Value
+		leftExpr = executor.Expression{Constant: &v}
+	}
+
+	if rightIdx >= 0 {
+		rightExpr = executor.Expression{ColumnIndex: &rightIdx}
+	} else if pred.Comparison.Right.Constant != nil {
+		v := pred.Comparison.Right.Constant.Value
+		rightExpr = executor.Expression{Constant: &v}
+	}
+
+	return executor.Predicate{
+		Left:  leftExpr,
+		Op:    executor.ComparisonOp(pred.Comparison.Op),
+		Right: rightExpr,
 	}
 }

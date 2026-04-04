@@ -12,6 +12,7 @@ import (
 	"discodb/discord"
 	"discodb/executor"
 	discodbsql "discodb/sql"
+	"discodb/storage"
 	"discodb/types"
 )
 
@@ -100,6 +101,28 @@ func (e *Engine) Close() error {
 	return nil
 }
 
+func (e *Engine) ReadRows(ctx context.Context, tableID types.TableID) ([]storage.Row, error) {
+	segments, err := e.segMgr.ListSegments(ctx, tableID)
+	if err != nil {
+		return nil, fmt.Errorf("list segments: %w", err)
+	}
+
+	var allRows []storage.Row
+	for _, seg := range segments {
+		rows, _, err := e.segMgr.ReadRows(ctx, seg.ID)
+		if err != nil {
+			e.logger.Warn("failed to read rows from segment",
+				slog.String("segment", seg.Name),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		allRows = append(allRows, rows...)
+	}
+
+	return allRows, nil
+}
+
 func (e *Engine) ExecuteQuery(query string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
 	stmt, err := discodbsql.Parse(query)
 	if err != nil {
@@ -114,16 +137,42 @@ func (e *Engine) ExecuteQuery(query string) ([]executor.ColumnInfo, []executor.R
 	case discodbsql.SelectStmt:
 		return e.handleSelect(s)
 	case discodbsql.DeleteStmt:
-		return nil, nil, 0, fmt.Errorf("unsupported: DELETE")
+		return e.handleDelete(s)
 	case discodbsql.UpdateStmt:
-		return nil, nil, 0, fmt.Errorf("unsupported: UPDATE")
+		return e.handleUpdate(s)
 	case discodbsql.DropTableStmt:
-		return nil, nil, 0, fmt.Errorf("unsupported: DROP TABLE")
+		return e.handleDropTable(s)
 	case discodbsql.CreateIndexStmt:
 		return nil, nil, 0, fmt.Errorf("unsupported: CREATE INDEX")
 	default:
 		return nil, nil, 0, fmt.Errorf("unsupported statement type")
 	}
+}
+
+func (e *Engine) executePlan(plan executor.PhysicalPlan) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	ctx := context.Background()
+
+	var allRows []executor.Row
+	var schema []executor.ColumnInfo
+
+	for {
+		batch, done, err := plan.Root.Execute(ctx)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+
+		if schema == nil {
+			schema = batch.Schema
+		}
+
+		allRows = append(allRows, batch.Rows...)
+
+		if done {
+			break
+		}
+	}
+
+	return schema, allRows, uint64(len(allRows)), nil
 }
 
 func (e *Engine) nextTxnID() types.TxnID {

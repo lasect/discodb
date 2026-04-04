@@ -2,12 +2,20 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 
+	"discodb/storage"
 	"discodb/types"
 )
 
 var ErrUnsupportedExpression = errors.New("unsupported expression")
+
+type StorageReader interface {
+	ReadRows(ctx context.Context, tableID types.TableID) ([]storage.Row, error)
+}
 
 type PhysicalPlan struct {
 	Root Executor
@@ -66,9 +74,13 @@ type Expression struct {
 }
 
 type Predicate struct {
-	Left  Expression   `json:"left"`
-	Op    ComparisonOp `json:"op"`
-	Right Expression   `json:"right"`
+	Left  Expression   `json:"left,omitempty"`
+	Op    ComparisonOp `json:"op,omitempty"`
+	Right Expression   `json:"right,omitempty"`
+
+	LeftPred  *Predicate   `json:"left_pred,omitempty"`
+	RightPred *Predicate   `json:"right_pred,omitempty"`
+	LogicalOp ComparisonOp `json:"logical_op,omitempty"`
 }
 
 type Aggregate string
@@ -82,17 +94,40 @@ const (
 )
 
 type SeqScan struct {
+	Reader  StorageReader
 	TableID types.TableID
 	Filter  *Predicate
 	Schema  []ColumnInfo
 }
 
-func NewSeqScan(tableID types.TableID, filter *Predicate, schema []ColumnInfo) *SeqScan {
-	return &SeqScan{TableID: tableID, Filter: filter, Schema: schema}
+func NewSeqScan(reader StorageReader, tableID types.TableID, filter *Predicate, schema []ColumnInfo) *SeqScan {
+	return &SeqScan{Reader: reader, TableID: tableID, Filter: filter, Schema: append([]ColumnInfo(nil), schema...)}
 }
 
-func (s *SeqScan) Execute(context.Context) (RowBatch, bool, error) {
-	return RowBatch{Rows: []Row{}, Schema: append([]ColumnInfo(nil), s.Schema...)}, true, nil
+func (s *SeqScan) Execute(ctx context.Context) (RowBatch, bool, error) {
+	storageRows, err := s.Reader.ReadRows(ctx, s.TableID)
+	if err != nil {
+		return RowBatch{}, false, fmt.Errorf("seq scan read: %w", err)
+	}
+
+	var rows []Row
+	for _, sr := range storageRows {
+		values := storageRowToValues(sr)
+		for len(values) < len(s.Schema) {
+			values = append(values, types.NullValue())
+		}
+
+		if s.Filter != nil {
+			row := Row{Values: values}
+			if !EvaluatePredicate(row, *s.Filter) {
+				continue
+			}
+		}
+
+		rows = append(rows, Row{Values: values})
+	}
+
+	return RowBatch{Rows: rows, Schema: append([]ColumnInfo(nil), s.Schema...)}, true, nil
 }
 
 type IndexScan struct {
@@ -103,7 +138,7 @@ type IndexScan struct {
 }
 
 func NewIndexScan(tableID, indexID types.TableID, keyRange *[2]types.Value, schema []ColumnInfo) *IndexScan {
-	return &IndexScan{TableID: tableID, IndexID: indexID, KeyRange: keyRange, Schema: schema}
+	return &IndexScan{TableID: tableID, IndexID: indexID, KeyRange: keyRange, Schema: append([]ColumnInfo(nil), schema...)}
 }
 
 func (s *IndexScan) Execute(context.Context) (RowBatch, bool, error) {
@@ -116,16 +151,48 @@ type Filter struct {
 }
 
 func (f *Filter) Execute(ctx context.Context) (RowBatch, bool, error) {
-	return RowBatch{}, true, nil
+	batch, done, err := f.Input.Execute(ctx)
+	if err != nil {
+		return RowBatch{}, false, err
+	}
+
+	var filtered []Row
+	for _, row := range batch.Rows {
+		if EvaluatePredicate(row, f.Predicate) {
+			filtered = append(filtered, row)
+		}
+	}
+
+	return RowBatch{Rows: filtered, Schema: append([]ColumnInfo(nil), batch.Schema...)}, done, nil
 }
 
 type Projection struct {
 	Input   Executor
 	Columns []int
+	Schema  []ColumnInfo
 }
 
 func (p *Projection) Execute(ctx context.Context) (RowBatch, bool, error) {
-	return RowBatch{}, true, nil
+	batch, done, err := p.Input.Execute(ctx)
+	if err != nil {
+		return RowBatch{}, false, err
+	}
+
+	var projected []Row
+	for _, row := range batch.Rows {
+		var vals []types.Value
+		for _, idx := range p.Columns {
+			if idx >= 0 && idx < len(row.Values) {
+				vals = append(vals, row.Values[idx])
+			} else {
+				vals = append(vals, types.NullValue())
+			}
+		}
+		projected = append(projected, Row{Values: vals})
+	}
+
+	schema := append([]ColumnInfo(nil), p.Schema...)
+	return RowBatch{Rows: projected, Schema: schema}, done, nil
 }
 
 type Limit struct {
@@ -138,10 +205,258 @@ func (l *Limit) Execute(ctx context.Context) (RowBatch, bool, error) {
 	if l.Remaining == 0 {
 		return RowBatch{}, false, nil
 	}
-	return RowBatch{}, true, nil
+
+	batch, done, err := l.Input.Execute(ctx)
+	if err != nil {
+		return RowBatch{}, false, err
+	}
+
+	var result []Row
+	for _, row := range batch.Rows {
+		if l.Offset > 0 {
+			l.Offset--
+			continue
+		}
+		if l.Remaining <= 0 {
+			return RowBatch{Rows: result, Schema: append([]ColumnInfo(nil), batch.Schema...)}, false, nil
+		}
+		result = append(result, row)
+		l.Remaining--
+	}
+
+	if l.Remaining == 0 {
+		done = false
+	}
+
+	return RowBatch{Rows: result, Schema: append([]ColumnInfo(nil), batch.Schema...)}, done, nil
+}
+
+type Values struct {
+	Rows   []Row
+	Schema []ColumnInfo
+	pos    int
+}
+
+func NewValues(rows []Row, schema []ColumnInfo) *Values {
+	return &Values{Rows: rows, Schema: append([]ColumnInfo(nil), schema...)}
+}
+
+func (v *Values) Execute(context.Context) (RowBatch, bool, error) {
+	if v.pos >= len(v.Rows) {
+		return RowBatch{}, true, nil
+	}
+	v.pos = len(v.Rows)
+	return RowBatch{Rows: v.Rows, Schema: append([]ColumnInfo(nil), v.Schema...)}, true, nil
+}
+
+type DeleteExec struct {
+	Input    Executor
+	TableID  types.TableID
+	consumed bool
+}
+
+func (d *DeleteExec) Execute(ctx context.Context) (RowBatch, bool, error) {
+	if d.consumed {
+		return RowBatch{}, true, nil
+	}
+	d.consumed = true
+
+	var rows []Row
+	for {
+		batch, done, err := d.Input.Execute(ctx)
+		if err != nil {
+			return RowBatch{}, false, err
+		}
+		rows = append(rows, batch.Rows...)
+		if done {
+			break
+		}
+	}
+
+	return RowBatch{Rows: rows, Schema: []ColumnInfo{{Name: "deleted", Ordinal: 0}}}, true, nil
+}
+
+type UpdateExec struct {
+	Input    Executor
+	TableID  types.TableID
+	SetCols  []string
+	SetExprs []Expression
+	consumed bool
+}
+
+func (u *UpdateExec) Execute(ctx context.Context) (RowBatch, bool, error) {
+	if u.consumed {
+		return RowBatch{}, true, nil
+	}
+	u.consumed = true
+
+	var rows []Row
+	for {
+		batch, done, err := u.Input.Execute(ctx)
+		if err != nil {
+			return RowBatch{}, false, err
+		}
+		rows = append(rows, batch.Rows...)
+		if done {
+			break
+		}
+	}
+
+	return RowBatch{Rows: rows, Schema: []ColumnInfo{{Name: "updated", Ordinal: 0}}}, true, nil
+}
+
+type AggregateExec struct {
+	Input    Executor
+	Funcs    []Aggregate
+	ColIdxs  []int
+	Aliases  []string
+	consumed bool
+}
+
+func (a *AggregateExec) Execute(ctx context.Context) (RowBatch, bool, error) {
+	if a.consumed {
+		return RowBatch{}, true, nil
+	}
+	a.consumed = true
+
+	var accumulators []aggAccumulator
+	for _, fn := range a.Funcs {
+		accumulators = append(accumulators, newAccumulator(fn))
+	}
+
+	for {
+		batch, done, err := a.Input.Execute(ctx)
+		if err != nil {
+			return RowBatch{}, false, err
+		}
+
+		for _, row := range batch.Rows {
+			for i, idx := range a.ColIdxs {
+				accumulators[i].accumulate(row, idx)
+			}
+		}
+
+		if done {
+			break
+		}
+	}
+
+	var vals []types.Value
+	var schema []ColumnInfo
+	for i, acc := range accumulators {
+		vals = append(vals, acc.result())
+		name := ""
+		if i < len(a.Aliases) {
+			name = a.Aliases[i]
+		}
+		if name == "" {
+			name = string(a.Funcs[i])
+		}
+		schema = append(schema, ColumnInfo{Name: name, Ordinal: i})
+	}
+
+	return RowBatch{Rows: []Row{{Values: vals}}, Schema: schema}, true, nil
+}
+
+type aggAccumulator struct {
+	fn    Aggregate
+	count int
+	sum   float64
+	min   types.Value
+	max   types.Value
+}
+
+func newAccumulator(fn Aggregate) aggAccumulator {
+	a := aggAccumulator{fn: fn}
+	if fn == AggregateMin {
+		a.min = types.NullValue()
+	}
+	if fn == AggregateMax {
+		a.max = types.NullValue()
+	}
+	return a
+}
+
+func (a *aggAccumulator) accumulate(row Row, idx int) {
+	val, ok := row.Get(idx)
+	if !ok || val.IsNull() {
+		return
+	}
+
+	a.count++
+
+	switch a.fn {
+	case AggregateSum, AggregateAvg:
+		if f, ok := val.AsFloat64(); ok {
+			a.sum += f
+		}
+	case AggregateMin:
+		if a.min.IsNull() || compareValues(val, a.min) < 0 {
+			a.min = val
+		}
+	case AggregateMax:
+		if a.max.IsNull() || compareValues(val, a.max) > 0 {
+			a.max = val
+		}
+	}
+}
+
+func (a *aggAccumulator) result() types.Value {
+	switch a.fn {
+	case AggregateCount:
+		return types.Int8Value(int64(a.count))
+	case AggregateSum:
+		return types.Float8Value(a.sum)
+	case AggregateAvg:
+		if a.count == 0 {
+			return types.NullValue()
+		}
+		return types.Float8Value(a.sum / float64(a.count))
+	case AggregateMin:
+		return a.min
+	case AggregateMax:
+		return a.max
+	default:
+		return types.NullValue()
+	}
+}
+
+func compareValues(a, b types.Value) int {
+	af, aok := a.AsFloat64()
+	bf, bok := b.AsFloat64()
+	if aok && bok {
+		if af < bf {
+			return -1
+		}
+		if af > bf {
+			return 1
+		}
+		return 0
+	}
+
+	as, aok := a.AsString()
+	bs, bok := b.AsString()
+	if aok && bok {
+		return strings.Compare(as, bs)
+	}
+
+	return 0
 }
 
 func EvaluatePredicate(row Row, pred Predicate) bool {
+	switch pred.Op {
+	case ComparisonAnd:
+		if pred.LeftPred == nil || pred.RightPred == nil {
+			return false
+		}
+		return EvaluatePredicate(row, *pred.LeftPred) && EvaluatePredicate(row, *pred.RightPred)
+	case ComparisonOr:
+		if pred.LeftPred == nil || pred.RightPred == nil {
+			return false
+		}
+		return EvaluatePredicate(row, *pred.LeftPred) || EvaluatePredicate(row, *pred.RightPred)
+	}
+
 	left, ok := evaluateExpression(row, pred.Left)
 	if !ok {
 		return false
@@ -150,14 +465,93 @@ func EvaluatePredicate(row Row, pred Predicate) bool {
 	if !ok {
 		return false
 	}
-	switch pred.Op {
+
+	return compareValuesOp(left, right, pred.Op)
+}
+
+func compareValuesOp(left, right types.Value, op ComparisonOp) bool {
+	switch op {
 	case ComparisonEq:
 		return left.Equal(right)
 	case ComparisonNe:
 		return !left.Equal(right)
+	case ComparisonLt:
+		return compareValues(left, right) < 0
+	case ComparisonLe:
+		return compareValues(left, right) <= 0
+	case ComparisonGt:
+		return compareValues(left, right) > 0
+	case ComparisonGe:
+		return compareValues(left, right) >= 0
+	case ComparisonLike:
+		ls, lok := left.AsString()
+		rs, rok := right.AsString()
+		if !lok || !rok {
+			return false
+		}
+		return likeMatch(ls, rs)
+	case ComparisonIn:
+		return left.Equal(right)
 	default:
 		return false
 	}
+}
+
+func likeMatch(s, pattern string) bool {
+	if pattern == "%" {
+		return true
+	}
+	if pattern == "" {
+		return s == ""
+	}
+
+	var re []rune
+	for _, c := range pattern {
+		switch c {
+		case '%':
+			re = append(re, '*', '*')
+		case '_':
+			re = append(re, '?')
+		default:
+			re = append(re, c)
+		}
+	}
+
+	return globMatch(s, string(re))
+}
+
+func globMatch(s, pattern string) bool {
+	if pattern == "" {
+		return s == ""
+	}
+
+	px := 0
+	sx := 0
+	starPx := -1
+	starSx := -1
+
+	for sx < len(s) {
+		if px < len(pattern) && (pattern[px] == '?' || pattern[px] == s[sx]) {
+			px++
+			sx++
+		} else if px < len(pattern) && pattern[px] == '*' {
+			starPx = px
+			starSx = sx
+			px++
+		} else if starPx >= 0 {
+			px = starPx + 1
+			starSx++
+			sx = starSx
+		} else {
+			return false
+		}
+	}
+
+	for px < len(pattern) && pattern[px] == '*' {
+		px++
+	}
+
+	return px == len(pattern)
 }
 
 func evaluateExpression(row Row, expr Expression) (types.Value, bool) {
@@ -168,4 +562,50 @@ func evaluateExpression(row Row, expr Expression) (types.Value, bool) {
 		return *expr.Constant, true
 	}
 	return types.NullValue(), false
+}
+
+func storageRowToValues(sr storage.Row) []types.Value {
+	var values []types.Value
+	for _, colVal := range sr.Body.Columns {
+		values = append(values, columnValueToTypesValue(colVal))
+	}
+	return values
+}
+
+func columnValueToTypesValue(cv storage.ColumnValue) types.Value {
+	switch cv.Kind {
+	case "bool":
+		if cv.Bool != nil {
+			return types.BoolValue(*cv.Bool)
+		}
+	case "int2":
+		if cv.Int16 != nil {
+			return types.Int2Value(*cv.Int16)
+		}
+	case "int4":
+		if cv.Int32 != nil {
+			return types.Int4Value(*cv.Int32)
+		}
+	case "int8":
+		if cv.Int64 != nil {
+			return types.Int8Value(*cv.Int64)
+		}
+	case "float4":
+		if cv.Float32 != nil {
+			return types.Float4Value(*cv.Float32)
+		}
+	case "float8":
+		if cv.Float64 != nil {
+			return types.Float8Value(*cv.Float64)
+		}
+	case "text":
+		if cv.Text != nil {
+			return types.TextValue(*cv.Text)
+		}
+	case "json":
+		if cv.Text != nil {
+			return types.JSONValue(json.RawMessage(*cv.Text))
+		}
+	}
+	return types.NullValue()
 }

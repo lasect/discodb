@@ -192,13 +192,257 @@ func (e *Engine) handleInsert(stmt discodbsql.InsertStmt) ([]executor.ColumnInfo
 }
 
 func (e *Engine) handleSelect(stmt discodbsql.SelectStmt) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
-	if stmt.From == nil {
-		return nil, nil, 0, fmt.Errorf("SELECT requires a FROM clause")
+	planner := discodbsql.NewPlanner(e.catalog, e)
+	plan, err := planner.Plan(stmt)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return e.executePlan(plan)
+}
+
+func (e *Engine) handleDelete(stmt discodbsql.DeleteStmt) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	planner := discodbsql.NewPlanner(e.catalog, e)
+	plan, err := planner.Plan(stmt)
+	if err != nil {
+		return nil, nil, 0, err
 	}
 
-	tableSchema, ok := e.catalog.GetTableByName(stmt.From.Name)
+	ctx := context.Background()
+	_, rows, _, err := e.executePlan(plan)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	tableSchema, ok := e.catalog.GetTableByName(stmt.Table.Name)
 	if !ok {
-		return nil, nil, 0, fmt.Errorf("table %q not found", stmt.From.Name)
+		return nil, nil, 0, fmt.Errorf("table %q not found", stmt.Table.Name)
+	}
+
+	segments, err := e.segMgr.ListSegments(ctx, tableSchema.ID)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("list segments: %w", err)
+	}
+
+	if len(segments) == 0 {
+		return nil, nil, 0, nil
+	}
+
+	segChannelID := segments[0].ID
+	txnID := e.nextTxnID()
+
+	beginRec := wal.Begin(txnID, e.nextLSN())
+	if err := e.walWriter.Append(ctx, beginRec); err != nil {
+		e.logger.Warn("WAL begin failed", slog.String("error", err.Error()))
+	}
+
+	var deleted int
+	for _, row := range rows {
+		if len(row.Values) < len(tableSchema.Columns) {
+			continue
+		}
+
+		var colValues []storage.ColumnValue
+		for i, val := range row.Values {
+			if i >= len(tableSchema.Columns) {
+				break
+			}
+			colValues = append(colValues, valueToColumnValue(val, tableSchema.Columns[i].DataType))
+		}
+
+		tombstoneRow := storage.Row{
+			Header: storage.RowHeader{
+				RowID:     e.nextRowID(),
+				TableID:   tableSchema.ID,
+				SegmentID: types.SegmentID(1),
+				MessageID: types.MessageID(0),
+				TxnID:     txnID,
+				LSN:       e.nextLSN(),
+				Flags:     storage.FlagTombstone,
+			},
+			Body: storage.RowBody{
+				Columns: colValues,
+			},
+		}
+
+		msg, err := e.segMgr.WriteRow(ctx, segChannelID, tombstoneRow, tableSchema.Epoch)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("write tombstone: %w", err)
+		}
+
+		delRec := wal.Record{
+			Kind:      "DELETE",
+			TxnID:     txnID,
+			LSN:       e.nextLSN(),
+			TableID:   tableSchema.ID,
+			RowID:     tombstoneRow.Header.RowID,
+			SegmentID: types.SegmentID(1),
+			MessageID: msg.ID,
+			Data:      nil,
+		}
+		if err := e.walWriter.Append(ctx, delRec); err != nil {
+			e.logger.Warn("WAL delete record failed", slog.String("error", err.Error()))
+		}
+
+		deleted++
+	}
+
+	commitRec := wal.Commit(txnID, e.nextLSN())
+	if err := e.walWriter.Append(ctx, commitRec); err != nil {
+		e.logger.Warn("WAL commit failed", slog.String("error", err.Error()))
+	}
+
+	e.logger.Info("rows deleted",
+		slog.String("table", stmt.Table.Name),
+		slog.Int("count", deleted),
+	)
+
+	return nil, nil, uint64(deleted), nil
+}
+
+func (e *Engine) handleUpdate(stmt discodbsql.UpdateStmt) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	planner := discodbsql.NewPlanner(e.catalog, e)
+	plan, err := planner.Plan(stmt)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	ctx := context.Background()
+	_, rows, _, err := e.executePlan(plan)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	tableSchema, ok := e.catalog.GetTableByName(stmt.Table.Name)
+	if !ok {
+		return nil, nil, 0, fmt.Errorf("table %q not found", stmt.Table.Name)
+	}
+
+	segments, err := e.segMgr.ListSegments(ctx, tableSchema.ID)
+	if err != nil {
+		return nil, nil, 0, fmt.Errorf("list segments: %w", err)
+	}
+
+	if len(segments) == 0 {
+		return nil, nil, 0, nil
+	}
+
+	segChannelID := segments[0].ID
+	txnID := e.nextTxnID()
+
+	beginRec := wal.Begin(txnID, e.nextLSN())
+	if err := e.walWriter.Append(ctx, beginRec); err != nil {
+		e.logger.Warn("WAL begin failed", slog.String("error", err.Error()))
+	}
+
+	var updated int
+	for _, row := range rows {
+		if len(row.Values) < len(tableSchema.Columns) {
+			continue
+		}
+
+		newValues := make([]types.Value, len(tableSchema.Columns))
+		copy(newValues, row.Values)
+
+		for i, setCol := range stmt.Set {
+			colIdx, ok := tableSchema.ColumnIndex(setCol.Column)
+			if !ok {
+				continue
+			}
+			if setCol.Value.Constant != nil && setCol.Value.Constant.Value.Valid {
+				newValues[colIdx] = setCol.Value.Constant.Value
+			}
+			_ = i
+		}
+
+		var colValues []storage.ColumnValue
+		for i, val := range newValues {
+			if i >= len(tableSchema.Columns) {
+				break
+			}
+			colValues = append(colValues, valueToColumnValue(val, tableSchema.Columns[i].DataType))
+		}
+
+		tombstoneRow := storage.Row{
+			Header: storage.RowHeader{
+				RowID:     e.nextRowID(),
+				TableID:   tableSchema.ID,
+				SegmentID: types.SegmentID(1),
+				MessageID: types.MessageID(0),
+				TxnID:     txnID,
+				LSN:       e.nextLSN(),
+				Flags:     storage.FlagTombstone,
+			},
+			Body: storage.RowBody{
+				Columns: colValues,
+			},
+		}
+
+		if _, err := e.segMgr.WriteRow(ctx, segChannelID, tombstoneRow, tableSchema.Epoch); err != nil {
+			return nil, nil, 0, fmt.Errorf("write tombstone for update: %w", err)
+		}
+
+		var newColValues []storage.ColumnValue
+		for i, val := range newValues {
+			if i >= len(tableSchema.Columns) {
+				break
+			}
+			newColValues = append(newColValues, valueToColumnValue(val, tableSchema.Columns[i].DataType))
+		}
+
+		newRow := storage.Row{
+			Header: storage.RowHeader{
+				RowID:     e.nextRowID(),
+				TableID:   tableSchema.ID,
+				SegmentID: types.SegmentID(1),
+				MessageID: types.MessageID(0),
+				TxnID:     txnID,
+				LSN:       e.nextLSN(),
+				Flags:     0,
+			},
+			Body: storage.RowBody{
+				Columns: newColValues,
+			},
+		}
+
+		msg, err := e.segMgr.WriteRow(ctx, segChannelID, newRow, tableSchema.Epoch)
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("write updated row: %w", err)
+		}
+
+		updateRec := wal.Record{
+			Kind:      "UPDATE",
+			TxnID:     txnID,
+			LSN:       e.nextLSN(),
+			TableID:   tableSchema.ID,
+			RowID:     newRow.Header.RowID,
+			SegmentID: types.SegmentID(1),
+			MessageID: msg.ID,
+			Data:      nil,
+		}
+		if err := e.walWriter.Append(ctx, updateRec); err != nil {
+			e.logger.Warn("WAL update record failed", slog.String("error", err.Error()))
+		}
+
+		updated++
+	}
+
+	commitRec := wal.Commit(txnID, e.nextLSN())
+	if err := e.walWriter.Append(ctx, commitRec); err != nil {
+		e.logger.Warn("WAL commit failed", slog.String("error", err.Error()))
+	}
+
+	e.logger.Info("rows updated",
+		slog.String("table", stmt.Table.Name),
+		slog.Int("count", updated),
+	)
+
+	return nil, nil, uint64(updated), nil
+}
+
+func (e *Engine) handleDropTable(stmt discodbsql.DropTableStmt) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	tableSchema, ok := e.catalog.GetTableByName(stmt.Name)
+	if !ok {
+		return nil, nil, 0, fmt.Errorf("table %q not found", stmt.Name)
 	}
 
 	ctx := context.Background()
@@ -208,94 +452,78 @@ func (e *Engine) handleSelect(stmt discodbsql.SelectStmt) ([]executor.ColumnInfo
 		return nil, nil, 0, fmt.Errorf("list segments: %w", err)
 	}
 
-	if len(segments) == 0 {
-		colInfos := make([]executor.ColumnInfo, len(tableSchema.Columns))
-		for i, col := range tableSchema.Columns {
-			colInfos[i] = executor.ColumnInfo{
-				Name:    col.Name,
-				Ordinal: int(col.Ordinal),
-			}
-		}
-		return colInfos, nil, 0, nil
+	txnID := e.nextTxnID()
+
+	beginRec := wal.Begin(txnID, e.nextLSN())
+	if err := e.walWriter.Append(ctx, beginRec); err != nil {
+		e.logger.Warn("WAL begin failed", slog.String("error", err.Error()))
 	}
 
-	var allResults []executor.Row
+	if len(segments) > 0 {
+		segChannelID := segments[0].ID
 
-	for _, seg := range segments {
-		rows, _, err := e.segMgr.ReadRows(ctx, seg.ID)
+		allRows, _, err := e.segMgr.ReadRows(ctx, segChannelID)
 		if err != nil {
-			e.logger.Warn("failed to read rows from segment",
-				slog.String("segment", seg.Name),
-				slog.String("error", err.Error()),
-			)
-			continue
+			e.logger.Warn("failed to read rows for drop", slog.String("error", err.Error()))
 		}
 
-		for _, row := range rows {
-			var values []types.Value
-			for _, colVal := range row.Body.Columns {
-				values = append(values, columnValueToTypesValue(colVal))
+		for _, row := range allRows {
+			if row.Header.Flags.HasTombstone() {
+				continue
 			}
 
-			for len(values) < len(tableSchema.Columns) {
-				values = append(values, types.NullValue())
+			tombstoneRow := storage.Row{
+				Header: storage.RowHeader{
+					RowID:     e.nextRowID(),
+					TableID:   tableSchema.ID,
+					SegmentID: types.SegmentID(1),
+					MessageID: types.MessageID(0),
+					TxnID:     txnID,
+					LSN:       e.nextLSN(),
+					Flags:     storage.FlagTombstone,
+				},
+				Body: row.Body,
 			}
 
-			if stmt.WhereClause != nil {
-				pred := buildPredicate(stmt.WhereClause, tableSchema)
-				execRow := executor.Row{Values: values}
-				if !executor.EvaluatePredicate(execRow, pred) {
-					continue
-				}
-			}
-
-			if len(stmt.Columns) == 1 && stmt.Columns[0].All {
-				allResults = append(allResults, executor.Row{Values: values})
-			} else {
-				var projected []types.Value
-				for _, selCol := range stmt.Columns {
-					if selCol.Name != "" {
-						idx, ok := tableSchema.ColumnIndex(selCol.Name)
-						if ok && idx < len(values) {
-							projected = append(projected, values[idx])
-						} else {
-							projected = append(projected, types.NullValue())
-						}
-					}
-				}
-				if len(projected) > 0 {
-					allResults = append(allResults, executor.Row{Values: projected})
-				} else {
-					allResults = append(allResults, executor.Row{Values: values})
-				}
+			if _, err := e.segMgr.WriteRow(ctx, segChannelID, tombstoneRow, tableSchema.Epoch); err != nil {
+				e.logger.Warn("failed to write tombstone during drop", slog.String("error", err.Error()))
 			}
 		}
 	}
 
-	if stmt.Limit != nil && *stmt.Limit < len(allResults) {
-		allResults = allResults[:*stmt.Limit]
+	payload, _ := json.Marshal(map[string]interface{}{
+		"name":     stmt.Name,
+		"table_id": tableSchema.ID.Uint64(),
+	})
+
+	catRec := wal.Record{
+		Kind:    "CATALOG_DROP_TABLE",
+		TxnID:   txnID,
+		LSN:     e.nextLSN(),
+		TableID: tableSchema.ID,
+		Data:    payload,
+	}
+	if err := e.walWriter.Append(ctx, catRec); err != nil {
+		e.logger.Warn("WAL catalog drop record failed", slog.String("error", err.Error()))
 	}
 
-	colInfos := make([]executor.ColumnInfo, len(tableSchema.Columns))
-	for i, col := range tableSchema.Columns {
-		colInfos[i] = executor.ColumnInfo{
-			Name:    col.Name,
-			Ordinal: int(col.Ordinal),
-		}
+	commitRec := wal.Commit(txnID, e.nextLSN())
+	if err := e.walWriter.Append(ctx, commitRec); err != nil {
+		e.logger.Warn("WAL commit failed", slog.String("error", err.Error()))
 	}
 
-	if len(stmt.Columns) > 0 && !stmt.Columns[0].All {
-		colInfos = nil
-		for _, selCol := range stmt.Columns {
-			if selCol.Name != "" {
-				colInfos = append(colInfos, executor.ColumnInfo{
-					Name: selCol.Name,
-				})
-			}
-		}
+	e.catalog.RemoveTable(tableSchema.ID)
+
+	if err := persistCatalogToDiscord(ctx, e.catalogClient, e.boot.GuildID, e.boot.CatalogCategory, e.catalog); err != nil {
+		e.logger.Warn("catalog persist failed", slog.String("error", err.Error()))
 	}
 
-	return colInfos, allResults, uint64(len(allResults)), nil
+	e.logger.Info("table dropped",
+		slog.String("name", stmt.Name),
+		slog.String("table_id", tableSchema.ID.String()),
+	)
+
+	return nil, nil, 0, nil
 }
 
 func valueToColumnValue(v types.Value, colType types.DataType) storage.ColumnValue {
@@ -364,85 +592,4 @@ func valueToColumnValue(v types.Value, colType types.DataType) storage.ColumnVal
 	}
 
 	return storage.ColumnValue{Kind: string(colType)}
-}
-
-func columnValueToTypesValue(cv storage.ColumnValue) types.Value {
-	switch cv.Kind {
-	case "bool":
-		if cv.Bool != nil {
-			return types.BoolValue(*cv.Bool)
-		}
-	case "int2":
-		if cv.Int16 != nil {
-			return types.Int2Value(*cv.Int16)
-		}
-	case "int4":
-		if cv.Int32 != nil {
-			return types.Int4Value(*cv.Int32)
-		}
-	case "int8":
-		if cv.Int64 != nil {
-			return types.Int8Value(*cv.Int64)
-		}
-	case "float4":
-		if cv.Float32 != nil {
-			return types.Float4Value(*cv.Float32)
-		}
-	case "float8":
-		if cv.Float64 != nil {
-			return types.Float8Value(*cv.Float64)
-		}
-	case "text":
-		if cv.Text != nil {
-			return types.TextValue(*cv.Text)
-		}
-	case "json":
-		if cv.Text != nil {
-			return types.JSONValue(json.RawMessage(*cv.Text))
-		}
-	}
-
-	return types.NullValue()
-}
-
-func buildPredicate(pred *discodbsql.Predicate, schema catalog.TableSchema) executor.Predicate {
-	if pred == nil || pred.Comparison == nil {
-		return executor.Predicate{}
-	}
-
-	leftIdx := -1
-	if pred.Comparison.Left.Column != "" {
-		if idx, ok := schema.ColumnIndex(pred.Comparison.Left.Column); ok {
-			leftIdx = idx
-		}
-	}
-
-	rightIdx := -1
-	if pred.Comparison.Right.Column != "" {
-		if idx, ok := schema.ColumnIndex(pred.Comparison.Right.Column); ok {
-			rightIdx = idx
-		}
-	}
-
-	var leftExpr, rightExpr executor.Expression
-
-	if leftIdx >= 0 {
-		leftExpr = executor.Expression{ColumnIndex: &leftIdx}
-	} else if pred.Comparison.Left.Constant != nil {
-		v := pred.Comparison.Left.Constant.Value
-		leftExpr = executor.Expression{Constant: &v}
-	}
-
-	if rightIdx >= 0 {
-		rightExpr = executor.Expression{ColumnIndex: &rightIdx}
-	} else if pred.Comparison.Right.Constant != nil {
-		v := pred.Comparison.Right.Constant.Value
-		rightExpr = executor.Expression{Constant: &v}
-	}
-
-	return executor.Predicate{
-		Left:  leftExpr,
-		Op:    executor.ComparisonOp(pred.Comparison.Op),
-		Right: rightExpr,
-	}
 }
