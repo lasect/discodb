@@ -176,7 +176,11 @@ func (e *Engine) ReadRowsWithSnapshot(ctx context.Context, tableID types.TableID
 			if row.Header.Flags.HasTombstone() {
 				continue
 			}
-			if !snap.IsVisible(row.Header.TxnID, &row.Header.TxnMax) {
+			var txnMax *types.TxnID
+			if row.Header.TxnMax > 0 {
+				txnMax = &row.Header.TxnMax
+			}
+			if !snap.IsVisible(row.Header.TxnID, txnMax) {
 				continue
 			}
 			allRows = append(allRows, row)
@@ -470,6 +474,8 @@ func (e *Engine) autoCommitTxn(connID string, t *txn.Transaction, wasExisting bo
 func (e *Engine) executePlanWithSnapshot(plan executor.PhysicalPlan, snap mvcc.TransactionSnapshot) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
 	ctx := context.Background()
 
+	e.injectSnapshot(plan.Root, snap)
+
 	var allRows []executor.Row
 	var schema []executor.ColumnInfo
 
@@ -493,6 +499,28 @@ func (e *Engine) executePlanWithSnapshot(plan executor.PhysicalPlan, snap mvcc.T
 	}
 
 	return schema, allRows, uint64(len(allRows)), nil
+}
+
+func (e *Engine) injectSnapshot(ex executor.Executor, snap mvcc.TransactionSnapshot) {
+	switch n := ex.(type) {
+	case *executor.SeqScan:
+		if n.Snapshot == nil {
+			n.Snapshot = &snap
+		}
+	case *executor.Filter:
+		e.injectSnapshot(n.Input, snap)
+	case *executor.Projection:
+		e.injectSnapshot(n.Input, snap)
+	case *executor.Limit:
+		e.injectSnapshot(n.Input, snap)
+	case *executor.DeleteExec:
+		e.injectSnapshot(n.Input, snap)
+	case *executor.UpdateExec:
+		e.injectSnapshot(n.Input, snap)
+	case *executor.AggregateExec:
+		e.injectSnapshot(n.Input, snap)
+	case *executor.IndexScan:
+	}
 }
 
 func (e *Engine) executePlan(plan executor.PhysicalPlan) ([]executor.ColumnInfo, []executor.Row, uint64, error) {

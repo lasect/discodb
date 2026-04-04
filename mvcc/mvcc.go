@@ -25,16 +25,16 @@ func (s *TransactionSnapshot) IsVisible(rowTxnID types.TxnID, rowTxnMax *types.T
 	if rowTxnID == s.TxnID {
 		return true
 	}
-	if rowTxnID < s.TxnMin {
-		return true
+	if rowTxnID > s.TxnID {
+		return false
 	}
 	if slices.Contains(s.ActiveTxns, rowTxnID) {
 		return false
 	}
-	if rowTxnMax != nil && *rowTxnMax > s.TxnID {
+	if rowTxnMax != nil && *rowTxnMax <= s.TxnID {
 		return false
 	}
-	return rowTxnID < s.TxnMax
+	return true
 }
 
 func (s *TransactionSnapshot) AddActive(txnID types.TxnID) {

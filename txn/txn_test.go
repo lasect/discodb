@@ -223,10 +223,10 @@ func TestMVCCVisibility(t *testing.T) {
 	}
 
 	if !snap.IsVisible(5, nil) {
-		t.Fatal("txn 5 < txn_min should be visible")
+		t.Fatal("txn 5 < snapshot.TxnID should be visible")
 	}
 	if !snap.IsVisible(8, nil) {
-		t.Fatal("txn 8 < txn_min should be visible")
+		t.Fatal("txn 8 < snapshot.TxnID should be visible")
 	}
 	if snap.IsVisible(12, nil) {
 		t.Fatal("txn 12 is active, should not be visible")
@@ -234,23 +234,29 @@ func TestMVCCVisibility(t *testing.T) {
 	if snap.IsVisible(15, nil) {
 		t.Fatal("txn 15 is active, should not be visible")
 	}
-	if !snap.IsVisible(18, nil) {
-		t.Fatal("txn 18 is not active and < txn_max, should be visible")
+	if snap.IsVisible(18, nil) {
+		t.Fatal("txn 18 > snapshot.TxnID, should not be visible")
 	}
 	if snap.IsVisible(25, nil) {
-		t.Fatal("txn 25 >= txn_max, should not be visible")
+		t.Fatal("txn 25 > snapshot.TxnID, should not be visible")
 	}
 
 	txnMax12 := types.TxnID(12)
-	if snap.IsVisible(5, &txnMax12) {
-		t.Fatal("row created at txn 5 but deleted at txn 12 should not be visible")
+	if !snap.IsVisible(5, &txnMax12) {
+		t.Fatal("row created at txn 5 but deleted at txn 12 SHOULD be visible to snapshot at txn 10 (deletion is in the future)")
+	}
+
+	txnMax8 := types.TxnID(8)
+	if snap.IsVisible(5, &txnMax8) {
+		t.Fatal("row created at txn 5 but deleted at txn 8 should not be visible (deletion before snapshot)")
 	}
 }
 
 func TestVersionChain(t *testing.T) {
 	v1 := mvcc.NewRowVersion(1, 1, 1, 100, 5, 1, []byte("v1"))
 	v2 := mvcc.NewRowVersion(1, 1, 1, 200, 10, 2, []byte("v2"))
-	v3 := mvcc.NewRowVersion(1, 1, 1, 300, 15, 3, []byte("v3")).WithTombstone(15)
+	v3 := mvcc.NewRowVersion(1, 1, 1, 300, 15, 3, []byte("v3"))
+	v3.IsTombstone = true
 
 	chain := mvcc.VersionChain{}
 	chain.Push(v1)
@@ -285,6 +291,9 @@ func TestVersionChain(t *testing.T) {
 	}
 	if !latest2.IsTombstone {
 		t.Fatal("expected tombstone for snapshot 20")
+	}
+	if latest2.TxnID != 15 {
+		t.Fatalf("expected txn ID 15 for tombstone, got %d", latest2.TxnID)
 	}
 }
 

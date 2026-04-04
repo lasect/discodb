@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"discodb/mvcc"
 	"discodb/storage"
 	"discodb/types"
 )
@@ -94,14 +95,19 @@ const (
 )
 
 type SeqScan struct {
-	Reader  StorageReader
-	TableID types.TableID
-	Filter  *Predicate
-	Schema  []ColumnInfo
+	Reader   StorageReader
+	TableID  types.TableID
+	Filter   *Predicate
+	Schema   []ColumnInfo
+	Snapshot *mvcc.TransactionSnapshot
 }
 
 func NewSeqScan(reader StorageReader, tableID types.TableID, filter *Predicate, schema []ColumnInfo) *SeqScan {
 	return &SeqScan{Reader: reader, TableID: tableID, Filter: filter, Schema: append([]ColumnInfo(nil), schema...)}
+}
+
+func NewSeqScanWithSnapshot(reader StorageReader, tableID types.TableID, filter *Predicate, schema []ColumnInfo, snap mvcc.TransactionSnapshot) *SeqScan {
+	return &SeqScan{Reader: reader, TableID: tableID, Filter: filter, Schema: append([]ColumnInfo(nil), schema...), Snapshot: &snap}
 }
 
 func (s *SeqScan) Execute(ctx context.Context) (RowBatch, bool, error) {
@@ -112,6 +118,20 @@ func (s *SeqScan) Execute(ctx context.Context) (RowBatch, bool, error) {
 
 	var rows []Row
 	for _, sr := range storageRows {
+		if sr.Header.Flags.HasTombstone() {
+			continue
+		}
+
+		if s.Snapshot != nil {
+			var txnMax *types.TxnID
+			if sr.Header.TxnMax > 0 {
+				txnMax = &sr.Header.TxnMax
+			}
+			if !s.Snapshot.IsVisible(sr.Header.TxnID, txnMax) {
+				continue
+			}
+		}
+
 		values := storageRowToValues(sr)
 		for len(values) < len(s.Schema) {
 			values = append(values, types.NullValue())
