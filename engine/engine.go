@@ -70,7 +70,7 @@ func NewEngine(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 
 	cat := catalog.New()
 
-	walWriter := NewWALWriter(bootstrapper.WALClient(), bootInfo.WALChannel, logger)
+	walWriter := NewWALWriter(bootstrapper.WALClient(), bootInfo.WALWebhook, bootInfo.WALChannel, logger)
 	walReader := NewWALReader(bootstrapper.WALClient(), bootInfo.WALChannel, logger)
 
 	if err := walReader.Replay(ctx, cat); err != nil {
@@ -89,6 +89,10 @@ func NewEngine(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 		cfg.Storage.HeapChannelPrefix,
 		logger,
 	)
+
+	if err := segMgr.PopulateWebhookCache(ctx); err != nil {
+		logger.Warn("webhook cache population failed (non-fatal)", slog.String("error", err.Error()))
+	}
 
 	eng := &Engine{
 		cfg:            cfg,

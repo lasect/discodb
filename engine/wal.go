@@ -16,14 +16,16 @@ import (
 
 type WALWriter struct {
 	client     *discord.Client
+	webhook    *discord.WebhookClient
 	walChannel types.ChannelID
 	logger     *slog.Logger
 	walEncoder *wal.Writer
 }
 
-func NewWALWriter(client *discord.Client, walChannel types.ChannelID, logger *slog.Logger) *WALWriter {
+func NewWALWriter(client *discord.Client, webhook *discord.WebhookClient, walChannel types.ChannelID, logger *slog.Logger) *WALWriter {
 	return &WALWriter{
 		client:     client,
+		webhook:    webhook,
 		walChannel: walChannel,
 		logger:     logger,
 		walEncoder: wal.NewWriter(),
@@ -37,12 +39,20 @@ func (ww *WALWriter) Append(ctx context.Context, record wal.Record) error {
 
 	content := fmt.Sprintf("WAL:%d:%s", writeID, base64.StdEncoding.EncodeToString(encoded))
 
-	msg, err := ww.client.SendMessage(ctx, ww.walChannel, discord.MessageSendParams{
+	params := discord.MessageSendParams{
 		Content: content,
 		AllowedMentions: &discord.AllowedMentions{
 			Parse: []string{},
 		},
-	})
+	}
+
+	var msg *discord.Message
+	var err error
+	if ww.webhook != nil {
+		msg, err = ww.webhook.SendWebhookMessage(ctx, params)
+	} else {
+		msg, err = ww.client.SendMessage(ctx, ww.walChannel, params)
+	}
 	if err != nil {
 		return fmt.Errorf("send WAL message: %w", err)
 	}

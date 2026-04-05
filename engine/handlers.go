@@ -71,7 +71,7 @@ func (e *Engine) handleCreateIndex(stmt discodbsql.CreateIndexStmt, connID strin
 		return nil, nil, 0, fmt.Errorf("auto-commit: %w", err)
 	}
 
-	if err := persistCatalogToDiscord(ctx, e.catalogClient, e.boot.GuildID, e.boot.CatalogCategory, e.catalog); err != nil {
+	if err := persistCatalogToDiscord(ctx, e.catalogClient, e.boot.CatalogWebhook, e.boot.GuildID, e.boot.CatalogCategory, e.catalog); err != nil {
 		e.logger.Warn("catalog persist failed", slog.String("error", err.Error()))
 	}
 
@@ -123,7 +123,7 @@ func (e *Engine) handleCreateTable(stmt discodbsql.CreateTableStmt, connID strin
 		return nil, nil, 0, fmt.Errorf("auto-commit: %w", err)
 	}
 
-	if err := persistCatalogToDiscord(ctx, e.catalogClient, e.boot.GuildID, e.boot.CatalogCategory, e.catalog); err != nil {
+	if err := persistCatalogToDiscord(ctx, e.catalogClient, e.boot.CatalogWebhook, e.boot.GuildID, e.boot.CatalogCategory, e.catalog); err != nil {
 		e.logger.Warn("catalog persist failed", slog.String("error", err.Error()))
 	}
 
@@ -507,7 +507,7 @@ func (e *Engine) handleDropTable(stmt discodbsql.DropTableStmt, connID string) (
 
 	e.catalog.RemoveTable(tableSchema.ID)
 
-	if err := persistCatalogToDiscord(ctx, e.catalogClient, e.boot.GuildID, e.boot.CatalogCategory, e.catalog); err != nil {
+	if err := persistCatalogToDiscord(ctx, e.catalogClient, e.boot.CatalogWebhook, e.boot.GuildID, e.boot.CatalogCategory, e.catalog); err != nil {
 		e.logger.Warn("catalog persist failed", slog.String("error", err.Error()))
 	}
 

@@ -27,7 +27,7 @@ func TestWALReplayWithFakeTransportPagination(t *testing.T) {
 		t.Fatalf("CreateTextChannel() error = %v", err)
 	}
 
-	writer := NewWALWriter(client, walChannel.ID, logger)
+	writer := NewWALWriter(client, nil, walChannel.ID, logger)
 	// Write >100 messages to force ListAllMessages pagination during replay.
 	for i := 1; i <= 130; i++ {
 		txn := types.TxnID(i)

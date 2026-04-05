@@ -11,12 +11,16 @@ import (
 	"discodb/discord"
 	"discodb/mapping"
 	"discodb/types"
+
+	"github.com/bwmarrin/discordgo"
 )
 
 type BootInfo struct {
 	GuildID         types.GuildID
 	CatalogCategory types.ChannelID
 	WALChannel      types.ChannelID
+	WALWebhook      *discord.WebhookClient
+	CatalogWebhook  *discord.WebhookClient
 }
 
 type Bootstrapper struct {
@@ -27,6 +31,8 @@ type Bootstrapper struct {
 	overflowClient *discord.Client
 	cfg            config.Config
 	logger         *slog.Logger
+	timeout        time.Duration
+	maxRetries     int
 }
 
 func NewBootstrapper(cfg config.Config, logger *slog.Logger) (*Bootstrapper, error) {
@@ -83,6 +89,8 @@ func NewBootstrapper(cfg config.Config, logger *slog.Logger) (*Bootstrapper, err
 		overflowClient: overflowClient,
 		cfg:            cfg,
 		logger:         logger,
+		timeout:        timeout(cfg),
+		maxRetries:     int(cfg.Discord.MaxRetries),
 	}, nil
 }
 
@@ -130,10 +138,26 @@ func (b *Bootstrapper) Bootstrap(ctx context.Context) (*BootInfo, error) {
 		return nil, fmt.Errorf("create WAL channel: %w", err)
 	}
 
+	walWebhook, err := b.createWebhook(ctx, walChannel.ID, "discodb-wal")
+	if err != nil {
+		return nil, fmt.Errorf("create WAL webhook: %w", err)
+	}
+
+	walWebhookClient := discord.NewWebhookClient(
+		walWebhook.ID,
+		walWebhook.Token,
+		walChannel.ID,
+		discord.WithWebhookLogger(b.logger),
+		discord.WithWebhookTimeout(b.timeout),
+		discord.WithWebhookMaxRetries(b.maxRetries),
+	)
+
 	bootRecord := mapping.BootRecord{
-		Version:         1,
+		Version:         2,
 		CatalogCategory: catalogCategory.ID,
 		WALChannel:      walChannel.ID,
+		WALWebhookID:    walWebhook.ID,
+		WALWebhookToken: walWebhook.Token,
 		CurrentEpoch:    types.MinSchemaEpoch(),
 		Checksum:        0,
 	}
@@ -161,6 +185,7 @@ func (b *Bootstrapper) Bootstrap(ctx context.Context) (*BootInfo, error) {
 		GuildID:         guildID,
 		CatalogCategory: catalogCategory.ID,
 		WALChannel:      walChannel.ID,
+		WALWebhook:      walWebhookClient,
 	}
 
 	b.logger.Info("bootstrap complete",
@@ -202,11 +227,32 @@ func (b *Bootstrapper) Discover(ctx context.Context, guildID types.GuildID) (*Bo
 			if content != "" {
 				record, err := mapping.ParseBootRecord(content)
 				if err == nil && record.CatalogCategory.Uint64() != 0 && record.WALChannel.Uint64() != 0 {
-					return &BootInfo{
+					bootInfo := &BootInfo{
 						GuildID:         guildID,
 						CatalogCategory: record.CatalogCategory,
 						WALChannel:      record.WALChannel,
-					}, nil
+					}
+					if record.WALWebhookID != "" && record.WALWebhookToken != "" {
+						bootInfo.WALWebhook = discord.NewWebhookClient(
+							record.WALWebhookID,
+							record.WALWebhookToken,
+							record.WALChannel,
+							discord.WithWebhookLogger(b.logger),
+							discord.WithWebhookTimeout(b.timeout),
+							discord.WithWebhookMaxRetries(b.maxRetries),
+						)
+					}
+					if record.CatalogWebhookID != "" && record.CatalogWebhookToken != "" {
+						bootInfo.CatalogWebhook = discord.NewWebhookClient(
+							record.CatalogWebhookID,
+							record.CatalogWebhookToken,
+							record.CatalogCategory,
+							discord.WithWebhookLogger(b.logger),
+							discord.WithWebhookTimeout(b.timeout),
+							discord.WithWebhookMaxRetries(b.maxRetries),
+						)
+					}
+					return bootInfo, nil
 				}
 			}
 		}
@@ -217,11 +263,32 @@ func (b *Bootstrapper) Discover(ctx context.Context, guildID types.GuildID) (*Bo
 				if strings.HasPrefix(msg.Content, "{\"version\":") {
 					record, err := mapping.ParseBootRecord(msg.Content)
 					if err == nil && record.CatalogCategory.Uint64() != 0 && record.WALChannel.Uint64() != 0 {
-						return &BootInfo{
+						bootInfo := &BootInfo{
 							GuildID:         guildID,
 							CatalogCategory: record.CatalogCategory,
 							WALChannel:      record.WALChannel,
-						}, nil
+						}
+						if record.WALWebhookID != "" && record.WALWebhookToken != "" {
+							bootInfo.WALWebhook = discord.NewWebhookClient(
+								record.WALWebhookID,
+								record.WALWebhookToken,
+								record.WALChannel,
+								discord.WithWebhookLogger(b.logger),
+								discord.WithWebhookTimeout(b.timeout),
+								discord.WithWebhookMaxRetries(b.maxRetries),
+							)
+						}
+						if record.CatalogWebhookID != "" && record.CatalogWebhookToken != "" {
+							bootInfo.CatalogWebhook = discord.NewWebhookClient(
+								record.CatalogWebhookID,
+								record.CatalogWebhookToken,
+								record.CatalogCategory,
+								discord.WithWebhookLogger(b.logger),
+								discord.WithWebhookTimeout(b.timeout),
+								discord.WithWebhookMaxRetries(b.maxRetries),
+							)
+						}
+						return bootInfo, nil
 					}
 				}
 			}
@@ -262,11 +329,39 @@ func (b *Bootstrapper) Discover(ctx context.Context, guildID types.GuildID) (*Bo
 		return nil, fmt.Errorf("catalog category found but WAL channel missing")
 	}
 
-	return &BootInfo{
+	bootInfo := &BootInfo{
 		GuildID:         guildID,
 		CatalogCategory: catalogCategory.ID,
 		WALChannel:      walChannel.ID,
-	}, nil
+	}
+
+	pinned, err := b.catalogClient.ListPinnedMessages(ctx, walChannel.ID)
+	if err == nil && len(pinned) > 0 {
+		if record, parseErr := mapping.ParseBootRecord(pinned[0].Content); parseErr == nil {
+			if record.WALWebhookID != "" && record.WALWebhookToken != "" {
+				bootInfo.WALWebhook = discord.NewWebhookClient(
+					record.WALWebhookID,
+					record.WALWebhookToken,
+					walChannel.ID,
+					discord.WithWebhookLogger(b.logger),
+					discord.WithWebhookTimeout(b.timeout),
+					discord.WithWebhookMaxRetries(b.maxRetries),
+				)
+			}
+			if record.CatalogWebhookID != "" && record.CatalogWebhookToken != "" {
+				bootInfo.CatalogWebhook = discord.NewWebhookClient(
+					record.CatalogWebhookID,
+					record.CatalogWebhookToken,
+					catalogCategory.ID,
+					discord.WithWebhookLogger(b.logger),
+					discord.WithWebhookTimeout(b.timeout),
+					discord.WithWebhookMaxRetries(b.maxRetries),
+				)
+			}
+		}
+	}
+
+	return bootInfo, nil
 }
 
 func (b *Bootstrapper) CatalogClient() *discord.Client {
@@ -287,4 +382,17 @@ func (b *Bootstrapper) IndexClient() *discord.Client {
 
 func (b *Bootstrapper) OverflowClient() *discord.Client {
 	return b.overflowClient
+}
+
+func (b *Bootstrapper) createWebhook(ctx context.Context, channelID types.ChannelID, name string) (*discordgo.Webhook, error) {
+	session := b.catalogClient.Session()
+	if session == nil {
+		return nil, fmt.Errorf("no session available for webhook creation")
+	}
+	return session.WebhookCreate(
+		channelID.String(),
+		name,
+		"",
+		discordgo.WithContext(ctx),
+	)
 }

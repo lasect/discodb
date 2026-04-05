@@ -59,19 +59,20 @@ func ParseSegmentName(name string) (types.TableID, types.SegmentID, error) {
 
 // PageHeader represents metadata stored in channel topic
 type PageHeader struct {
-	SegmentID   types.SegmentID   `json:"segment_id"`
-	TableID     types.TableID     `json:"table_id"`
-	RowCount    uint32            `json:"row_count"`
-	FreeSlots   uint32            `json:"free_slots"`
-	LSN         types.LSN         `json:"lsn"`
-	SchemaEpoch types.SchemaEpoch `json:"schema_epoch"`
-	Checksum    uint32            `json:"checksum"`
+	SegmentID    types.SegmentID   `json:"segment_id"`
+	TableID      types.TableID     `json:"table_id"`
+	RowCount     uint32            `json:"row_count"`
+	FreeSlots    uint32            `json:"free_slots"`
+	LSN          types.LSN         `json:"lsn"`
+	SchemaEpoch  types.SchemaEpoch `json:"schema_epoch"`
+	Checksum     uint32            `json:"checksum"`
+	WebhookID    uint64            `json:"webhook_id"`
+	WebhookToken [34]byte          `json:"webhook_token"`
 }
 
 // EncodeToTopic serializes PageHeader to channel topic string
 func (p PageHeader) EncodeToTopic() string {
-	// Binary encoding for compactness
-	buf := make([]byte, 42)
+	buf := make([]byte, 84)
 	binary.BigEndian.PutUint64(buf[0:8], p.SegmentID.Uint64())
 	binary.BigEndian.PutUint64(buf[8:16], p.TableID.Uint64())
 	binary.BigEndian.PutUint32(buf[16:20], p.RowCount)
@@ -79,10 +80,10 @@ func (p PageHeader) EncodeToTopic() string {
 	binary.BigEndian.PutUint64(buf[24:32], p.LSN.Uint64())
 	binary.BigEndian.PutUint32(buf[32:36], uint32(p.SchemaEpoch))
 	binary.BigEndian.PutUint32(buf[36:40], p.Checksum)
-	// Version byte
-	buf[40] = 1
-	// Reserved
-	buf[41] = 0
+	binary.BigEndian.PutUint64(buf[40:48], p.WebhookID)
+	copy(buf[48:82], p.WebhookToken[:])
+	buf[82] = 2
+	buf[83] = 0
 	return base64.StdEncoding.EncodeToString(buf)
 }
 
@@ -101,19 +102,28 @@ func ParsePageHeader(topic string) (PageHeader, error) {
 		return PageHeader{}, fmt.Errorf("topic too short: %d < 42", len(data))
 	}
 
-	version := data[40]
-	if version != 1 {
+	version := data[len(data)-2]
+	if version != 2 {
 		return PageHeader{}, fmt.Errorf("unsupported topic version: %d", version)
 	}
 
+	if len(data) < 84 {
+		return PageHeader{}, fmt.Errorf("topic too short for v2: %d < 84", len(data))
+	}
+
+	var token [34]byte
+	copy(token[:], data[48:82])
+
 	return PageHeader{
-		SegmentID:   types.SegmentID(binary.BigEndian.Uint64(data[0:8])),
-		TableID:     types.TableID(binary.BigEndian.Uint64(data[8:16])),
-		RowCount:    binary.BigEndian.Uint32(data[16:20]),
-		FreeSlots:   binary.BigEndian.Uint32(data[20:24]),
-		LSN:         types.LSN(binary.BigEndian.Uint64(data[24:32])),
-		SchemaEpoch: types.SchemaEpoch(binary.BigEndian.Uint32(data[32:36])),
-		Checksum:    binary.BigEndian.Uint32(data[36:40]),
+		SegmentID:    types.SegmentID(binary.BigEndian.Uint64(data[0:8])),
+		TableID:      types.TableID(binary.BigEndian.Uint64(data[8:16])),
+		RowCount:     binary.BigEndian.Uint32(data[16:20]),
+		FreeSlots:    binary.BigEndian.Uint32(data[20:24]),
+		LSN:          types.LSN(binary.BigEndian.Uint64(data[24:32])),
+		SchemaEpoch:  types.SchemaEpoch(binary.BigEndian.Uint32(data[32:36])),
+		Checksum:     binary.BigEndian.Uint32(data[36:40]),
+		WebhookID:    binary.BigEndian.Uint64(data[40:48]),
+		WebhookToken: token,
 	}, nil
 }
 
@@ -333,11 +343,15 @@ func ParseIndexKey(name string) (types.TableID, string, []byte, error) {
 
 // BootRecord represents the pinned bootstrap message
 type BootRecord struct {
-	Version         uint32            `json:"version"`
-	CatalogCategory types.ChannelID   `json:"catalog_category"`
-	WALChannel      types.ChannelID   `json:"wal_channel"`
-	CurrentEpoch    types.SchemaEpoch `json:"current_epoch"`
-	Checksum        uint32            `json:"checksum"`
+	Version             uint32            `json:"version"`
+	CatalogCategory     types.ChannelID   `json:"catalog_category"`
+	WALChannel          types.ChannelID   `json:"wal_channel"`
+	WALWebhookID        string            `json:"wal_webhook_id"`
+	WALWebhookToken     string            `json:"wal_webhook_token"`
+	CatalogWebhookID    string            `json:"catalog_webhook_id"`
+	CatalogWebhookToken string            `json:"catalog_webhook_token"`
+	CurrentEpoch        types.SchemaEpoch `json:"current_epoch"`
+	Checksum            uint32            `json:"checksum"`
 }
 
 // EncodeBootRecord serializes boot record to JSON

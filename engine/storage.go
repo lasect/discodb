@@ -6,11 +6,14 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 
 	"discodb/discord"
 	"discodb/mapping"
 	"discodb/storage"
 	"discodb/types"
+
+	"github.com/bwmarrin/discordgo"
 )
 
 type SegmentManager struct {
@@ -20,6 +23,8 @@ type SegmentManager struct {
 	catalogCatID  types.ChannelID
 	heapPrefix    string
 	logger        *slog.Logger
+	webhooks      map[types.ChannelID]*discord.WebhookClient
+	webhooksMu    sync.RWMutex
 }
 
 func NewSegmentManager(heapClient, catalogClient *discord.Client, guildID types.GuildID, catalogCatID types.ChannelID, heapPrefix string, logger *slog.Logger) *SegmentManager {
@@ -30,6 +35,7 @@ func NewSegmentManager(heapClient, catalogClient *discord.Client, guildID types.
 		catalogCatID:  catalogCatID,
 		heapPrefix:    heapPrefix,
 		logger:        logger,
+		webhooks:      make(map[types.ChannelID]*discord.WebhookClient),
 	}
 }
 
@@ -41,13 +47,21 @@ func (sm *SegmentManager) CreateSegment(ctx context.Context, tableID types.Table
 		return 0, fmt.Errorf("create text channel for segment: %w", err)
 	}
 
+	webhook, err := sm.createWebhook(ctx, ch.ID)
+	if err != nil {
+		sm.logger.Warn("failed to create webhook for segment (non-fatal)", slog.String("error", err.Error()))
+	}
+
 	header := mapping.PageHeader{
 		SegmentID: segmentID,
 		TableID:   tableID,
 		RowCount:  0,
 		FreeSlots: 0,
 		LSN:       types.LSN(0),
-		Checksum:  0,
+	}
+	if webhook != nil {
+		header.WebhookID = parseSnowflakeSafe(webhook.ID)
+		copy(header.WebhookToken[:], webhook.Token)
 	}
 
 	topic := header.EncodeToTopic()
@@ -55,6 +69,17 @@ func (sm *SegmentManager) CreateSegment(ctx context.Context, tableID types.Table
 		Topic: &topic,
 	}); err != nil {
 		sm.logger.Warn("failed to set segment topic (non-fatal)", slog.String("error", err.Error()))
+	}
+
+	if webhook != nil {
+		whClient := discord.NewWebhookClient(
+			webhook.ID,
+			webhook.Token,
+			ch.ID,
+		)
+		sm.webhooksMu.Lock()
+		sm.webhooks[ch.ID] = whClient
+		sm.webhooksMu.Unlock()
 	}
 
 	sm.logger.Info("created segment",
@@ -227,4 +252,71 @@ func (sm *SegmentManager) ListSegments(ctx context.Context, tableID types.TableI
 	}
 
 	return segments, nil
+}
+
+func (sm *SegmentManager) createWebhook(ctx context.Context, channelID types.ChannelID) (*discordgo.Webhook, error) {
+	session := sm.heapClient.Session()
+	if session == nil {
+		return nil, fmt.Errorf("no session available")
+	}
+	return session.WebhookCreate(
+		channelID.String(),
+		fmt.Sprintf("discodb-heap-%d", channelID.Uint64()),
+		"",
+		discordgo.WithContext(ctx),
+	)
+}
+
+func (sm *SegmentManager) getWebhook(channelID types.ChannelID) *discord.WebhookClient {
+	sm.webhooksMu.RLock()
+	defer sm.webhooksMu.RUnlock()
+	return sm.webhooks[channelID]
+}
+
+func (sm *SegmentManager) PopulateWebhookCache(ctx context.Context) error {
+	channels, err := sm.catalogClient.ListGuildChannels(ctx, sm.guildID)
+	if err != nil {
+		return fmt.Errorf("list channels for webhook cache: %w", err)
+	}
+
+	prefix := sm.heapPrefix
+	sm.webhooksMu.Lock()
+	defer sm.webhooksMu.Unlock()
+
+	for _, ch := range channels {
+		if ch.ParentID != nil && *ch.ParentID == sm.catalogCatID && strings.HasPrefix(ch.Name, prefix) {
+			if ch.Topic == "" {
+				continue
+			}
+			header, err := mapping.ParsePageHeader(ch.Topic)
+			if err != nil {
+				sm.logger.Debug("failed to parse page header for webhook cache",
+					slog.String("channel", ch.Name),
+					slog.String("error", err.Error()),
+				)
+				continue
+			}
+			if header.WebhookID == 0 || header.WebhookToken == [34]byte{} {
+				continue
+			}
+			token := string(header.WebhookToken[:])
+			whClient := discord.NewWebhookClient(
+				fmt.Sprintf("%d", header.WebhookID),
+				token,
+				ch.ID,
+			)
+			sm.webhooks[ch.ID] = whClient
+		}
+	}
+
+	sm.logger.Info("populated webhook cache", slog.Int("webhooks", len(sm.webhooks)))
+	return nil
+}
+
+func parseSnowflakeSafe(s string) uint64 {
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }

@@ -13,7 +13,7 @@ import (
 
 const catalogMsgPrefix = "CATALOG:"
 
-func persistCatalogToDiscord(ctx context.Context, client *discord.Client, guildID types.GuildID, catalogCatID types.ChannelID, cat *catalog.Catalog) error {
+func persistCatalogToDiscord(ctx context.Context, client *discord.Client, webhook *discord.WebhookClient, guildID types.GuildID, catalogCatID types.ChannelID, cat *catalog.Catalog) error {
 	snapshot := catalogSnapshot{
 		Tables:  make(map[uint64]tableSnapshot),
 		Indexes: make(map[uint64]indexSnapshot),
@@ -88,22 +88,35 @@ func persistCatalogToDiscord(ctx context.Context, client *discord.Client, guildI
 
 	for _, msg := range messages {
 		if strings.HasPrefix(msg.Content, catalogMsgPrefix) {
-			_, err := client.EditMessage(ctx, textChannel.ID, msg.ID, discord.MessageEditParams{
+			editParams := discord.MessageEditParams{
 				Content: &content,
-			})
-			if err != nil {
-				return fmt.Errorf("edit catalog message: %w", err)
+			}
+			if webhook != nil {
+				_, err := webhook.EditWebhookMessage(ctx, msg.ID, editParams)
+				if err != nil {
+					return fmt.Errorf("edit catalog message via webhook: %w", err)
+				}
+			} else {
+				_, err := client.EditMessage(ctx, textChannel.ID, msg.ID, editParams)
+				if err != nil {
+					return fmt.Errorf("edit catalog message: %w", err)
+				}
 			}
 			return nil
 		}
 	}
 
-	_, err = client.SendMessage(ctx, textChannel.ID, discord.MessageSendParams{
+	sendParams := discord.MessageSendParams{
 		Content: content,
 		AllowedMentions: &discord.AllowedMentions{
 			Parse: []string{},
 		},
-	})
+	}
+	if webhook != nil {
+		_, err = webhook.SendWebhookMessage(ctx, sendParams)
+	} else {
+		_, err = client.SendMessage(ctx, textChannel.ID, sendParams)
+	}
 	if err != nil {
 		return fmt.Errorf("send catalog message: %w", err)
 	}
