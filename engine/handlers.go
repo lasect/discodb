@@ -345,7 +345,12 @@ func (e *Engine) handleUpdate(stmt discodbsql.UpdateStmt, connID string) ([]exec
 			},
 		}
 
-		t.BufferInsert(tableSchema.ID, newRow)
+		if row.Meta != nil {
+			t.BufferUpdate(tableSchema.ID, newRow, row.Meta.RowID, row.Meta.SegmentID, row.Meta.MessageID)
+		} else {
+			// Fallback for rows without metadata (should not happen in normal operation)
+			t.BufferInsert(tableSchema.ID, newRow)
+		}
 		updated++
 	}
 

@@ -260,16 +260,23 @@ func (l *Lexer) skipWhitespace() {
 }
 
 func (l *Lexer) readString() Token {
-	l.pos++
-	start := l.pos
+	l.pos++ // skip opening quote
+	var result strings.Builder
 	for l.pos < len(l.input) {
 		if l.input[l.pos] == '\'' {
+			// Check for escaped quote ''
+			if l.pos+1 < len(l.input) && l.input[l.pos+1] == '\'' {
+				result.WriteByte('\'')
+				l.pos += 2
+				continue
+			}
 			l.pos++
-			return Token{Kind: TokString, Val: l.input[start : l.pos-1]}
+			return Token{Kind: TokString, Val: result.String()}
 		}
+		result.WriteByte(l.input[l.pos])
 		l.pos++
 	}
-	return Token{Kind: TokString, Val: l.input[start:]}
+	return Token{Kind: TokString, Val: result.String()}
 }
 
 func (l *Lexer) readQuotedIdent() Token {

@@ -37,12 +37,24 @@ type ColumnInfo struct {
 	Ordinal int            `json:"ordinal"`
 }
 
+// RowMeta contains storage-level metadata for a row, used for UPDATE/DELETE operations
+type RowMeta struct {
+	RowID     types.RowID     `json:"row_id"`
+	SegmentID types.SegmentID `json:"segment_id"`
+	MessageID types.MessageID `json:"message_id"`
+}
+
 type Row struct {
 	Values []types.Value `json:"values"`
+	Meta   *RowMeta      `json:"meta,omitempty"`
 }
 
 func NewRow(values []types.Value) Row {
 	return Row{Values: values}
+}
+
+func NewRowWithMeta(values []types.Value, meta *RowMeta) Row {
+	return Row{Values: values, Meta: meta}
 }
 
 func (r Row) Get(idx int) (types.Value, bool) {
@@ -137,14 +149,20 @@ func (s *SeqScan) Execute(ctx context.Context) (RowBatch, bool, error) {
 			values = append(values, types.NullValue())
 		}
 
+		meta := &RowMeta{
+			RowID:     sr.Header.RowID,
+			SegmentID: sr.Header.SegmentID,
+			MessageID: sr.Header.MessageID,
+		}
+
 		if s.Filter != nil {
-			row := Row{Values: values}
+			row := Row{Values: values, Meta: meta}
 			if !EvaluatePredicate(row, *s.Filter) {
 				continue
 			}
 		}
 
-		rows = append(rows, Row{Values: values})
+		rows = append(rows, Row{Values: values, Meta: meta})
 	}
 
 	return RowBatch{Rows: rows, Schema: append([]ColumnInfo(nil), s.Schema...)}, true, nil

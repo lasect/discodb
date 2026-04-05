@@ -46,6 +46,7 @@ type Engine struct {
 	txnManager   *txn.Manager
 	txnMu        sync.Mutex
 	connTxnState map[string]ConnTxnState
+	connTxnID    map[string]types.TxnID
 
 	lsnCounter     atomic.Uint64
 	rowCounter     atomic.Uint64
@@ -103,6 +104,7 @@ func NewEngine(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 		segMgr:         segMgr,
 		txnManager:     txn.NewManager(),
 		connTxnState:   make(map[string]ConnTxnState),
+		connTxnID:      make(map[string]types.TxnID),
 	}
 
 	eng.lsnCounter.Store(1)
@@ -243,6 +245,7 @@ func (e *Engine) handleBegin(connID string) ([]executor.ColumnInfo, []executor.R
 
 	e.txnMu.Lock()
 	e.connTxnState[connID] = ConnTxnActive
+	e.connTxnID[connID] = t.ID
 	e.txnMu.Unlock()
 
 	e.logger.Info("transaction began", slog.String("txn_id", t.ID.String()))
@@ -262,18 +265,22 @@ func (e *Engine) handleCommit(connID string) ([]executor.ColumnInfo, []executor.
 		return nil, nil, 0, fmt.Errorf("no active transaction to commit")
 	}
 
-	var activeTxn *txn.Transaction
-	for _, txnID := range e.txnManager.ActiveTransactions() {
-		t, ok := e.txnManager.GetTransaction(txnID)
-		if ok {
-			activeTxn = t
-			break
-		}
-	}
+	e.txnMu.Lock()
+	txnID, hasTxn := e.connTxnID[connID]
+	e.txnMu.Unlock()
 
-	if activeTxn == nil {
+	if !hasTxn {
 		e.txnMu.Lock()
 		e.connTxnState[connID] = ConnTxnIdle
+		e.txnMu.Unlock()
+		return nil, nil, 0, nil
+	}
+
+	activeTxn, ok := e.txnManager.GetTransaction(txnID)
+	if !ok {
+		e.txnMu.Lock()
+		e.connTxnState[connID] = ConnTxnIdle
+		delete(e.connTxnID, connID)
 		e.txnMu.Unlock()
 		return nil, nil, 0, nil
 	}
@@ -283,6 +290,7 @@ func (e *Engine) handleCommit(connID string) ([]executor.ColumnInfo, []executor.
 		_ = activeTxn.Abort()
 		e.txnMu.Lock()
 		e.connTxnState[connID] = ConnTxnFailed
+		delete(e.connTxnID, connID)
 		e.txnMu.Unlock()
 		return nil, nil, 0, fmt.Errorf("commit failed: %w", err)
 	}
@@ -290,6 +298,7 @@ func (e *Engine) handleCommit(connID string) ([]executor.ColumnInfo, []executor.
 	if err := activeTxn.Commit(); err != nil {
 		e.txnMu.Lock()
 		e.connTxnState[connID] = ConnTxnFailed
+		delete(e.connTxnID, connID)
 		e.txnMu.Unlock()
 		return nil, nil, 0, fmt.Errorf("commit failed: %w", err)
 	}
@@ -298,6 +307,7 @@ func (e *Engine) handleCommit(connID string) ([]executor.ColumnInfo, []executor.
 
 	e.txnMu.Lock()
 	e.connTxnState[connID] = ConnTxnIdle
+	delete(e.connTxnID, connID)
 	e.txnMu.Unlock()
 
 	e.logger.Info("transaction committed", slog.String("txn_id", activeTxn.ID.String()))
@@ -311,30 +321,25 @@ func (e *Engine) handleRollback(connID string) ([]executor.ColumnInfo, []executo
 
 	e.txnMu.Lock()
 	currentState := e.connTxnState[connID]
+	txnID, hasTxn := e.connTxnID[connID]
 	e.txnMu.Unlock()
 
 	if currentState != ConnTxnActive && currentState != ConnTxnFailed {
 		return nil, nil, 0, fmt.Errorf("no active transaction to rollback")
 	}
 
-	var activeTxn *txn.Transaction
-	for _, txnID := range e.txnManager.ActiveTransactions() {
-		t, ok := e.txnManager.GetTransaction(txnID)
-		if ok {
-			activeTxn = t
-			break
+	if hasTxn {
+		if activeTxn, ok := e.txnManager.GetTransaction(txnID); ok {
+			_ = activeTxn.Abort()
+			e.logger.Info("transaction rolled back", slog.String("txn_id", activeTxn.ID.String()))
 		}
-	}
-
-	if activeTxn != nil {
-		_ = activeTxn.Abort()
-		e.logger.Info("transaction rolled back", slog.String("txn_id", activeTxn.ID.String()))
 	}
 
 	e.txnManager.AdvanceTxnMin()
 
 	e.txnMu.Lock()
 	e.connTxnState[connID] = ConnTxnIdle
+	delete(e.connTxnID, connID)
 	e.txnMu.Unlock()
 
 	return nil, nil, 0, nil

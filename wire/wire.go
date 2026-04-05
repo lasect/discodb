@@ -22,6 +22,10 @@ const (
 	QueryStatusFailed           QueryStatus = 'E'
 )
 
+// maxMessageSize is the maximum allowed size for a single wire protocol message.
+// This prevents denial-of-service attacks via oversized message length fields.
+const maxMessageSize = 64 * 1024 * 1024 // 64 MB
+
 type ErrorSeverity string
 
 const (
@@ -152,6 +156,9 @@ func (s *Server) handleConnection(ctx context.Context, conn net.Conn, connID str
 		length := binary.BigEndian.Uint32(lengthBuf)
 		if length < 4 {
 			return fmt.Errorf("invalid message length: %d", length)
+		}
+		if length > maxMessageSize {
+			return fmt.Errorf("message too large: %d bytes (max %d)", length, maxMessageSize)
 		}
 		payload := make([]byte, int(length)-4)
 		if _, err := io.ReadFull(conn, payload); err != nil {

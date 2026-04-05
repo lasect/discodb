@@ -313,17 +313,33 @@ func (m *Manager) IsCommitted(id types.TxnID) bool {
 func (m *Manager) AdvanceTxnMin() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	oldMin := m.txnMin
 	if len(m.active) == 0 {
 		m.txnMin = m.txnMax
-		return
+	} else {
+		minID := m.txnMax
+		for id := range m.active {
+			if id < minID {
+				minID = id
+			}
+		}
+		m.txnMin = minID
 	}
-	minID := m.txnMax
-	for id := range m.active {
-		if id < minID {
-			minID = id
+	// Prune committed transactions that are no longer needed for visibility checks
+	if m.txnMin > oldMin {
+		m.pruneCommittedLocked()
+	}
+}
+
+// pruneCommittedLocked removes entries from the committed map that are older than txnMin.
+// These transactions are no longer needed for visibility checks since all active
+// transactions have a higher ID. Must be called with m.mu held.
+func (m *Manager) pruneCommittedLocked() {
+	for id := range m.committed {
+		if id < m.txnMin {
+			delete(m.committed, id)
 		}
 	}
-	m.txnMin = minID
 }
 
 func (m *Manager) RegisterCommittedFromReplay(id types.TxnID) {
