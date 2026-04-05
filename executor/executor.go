@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"discodb/index"
 	"discodb/mvcc"
 	"discodb/storage"
 	"discodb/types"
@@ -168,19 +169,104 @@ func (s *SeqScan) Execute(ctx context.Context) (RowBatch, bool, error) {
 	return RowBatch{Rows: rows, Schema: append([]ColumnInfo(nil), s.Schema...)}, true, nil
 }
 
+type IndexManager interface {
+	Lookup(ctx context.Context, indexID types.TableID, key []byte) ([]index.IndexEntry, error)
+	Range(ctx context.Context, indexID types.TableID, startKey []byte, endKey []byte) ([]index.IndexEntry, error)
+	FetchRow(ctx context.Context, tableID types.TableID, segmentID types.SegmentID, messageID types.MessageID) (*storage.Row, error)
+}
+
 type IndexScan struct {
-	TableID  types.TableID
-	IndexID  types.TableID
-	KeyRange *[2]types.Value
-	Schema   []ColumnInfo
+	TableID    types.TableID
+	IndexID    types.TableID
+	KeyRange   *[2]types.Value
+	Schema     []ColumnInfo
+	IndexMgr   IndexManager
+	Snapshot   *mvcc.TransactionSnapshot
+	StorageRdr StorageReader
 }
 
 func NewIndexScan(tableID, indexID types.TableID, keyRange *[2]types.Value, schema []ColumnInfo) *IndexScan {
 	return &IndexScan{TableID: tableID, IndexID: indexID, KeyRange: keyRange, Schema: append([]ColumnInfo(nil), schema...)}
 }
 
-func (s *IndexScan) Execute(context.Context) (RowBatch, bool, error) {
-	return RowBatch{Rows: []Row{}, Schema: append([]ColumnInfo(nil), s.Schema...)}, true, nil
+func NewIndexScanWithMgr(tableID, indexID types.TableID, keyRange *[2]types.Value, schema []ColumnInfo, mgr IndexManager, snap mvcc.TransactionSnapshot, rdr StorageReader) *IndexScan {
+	return &IndexScan{TableID: tableID, IndexID: indexID, KeyRange: keyRange, Schema: append([]ColumnInfo(nil), schema...), IndexMgr: mgr, Snapshot: &snap, StorageRdr: rdr}
+}
+
+func (s *IndexScan) Execute(ctx context.Context) (RowBatch, bool, error) {
+	if s.IndexMgr == nil {
+		return RowBatch{Rows: []Row{}, Schema: append([]ColumnInfo(nil), s.Schema...)}, true, nil
+	}
+
+	var entries []index.IndexEntry
+	var err error
+
+	if s.KeyRange != nil {
+		startKey := valueToKey(s.KeyRange[0])
+		endKey := valueToKey(s.KeyRange[1])
+		entries, err = s.IndexMgr.Range(ctx, s.IndexID, startKey, endKey)
+	} else {
+		entries, err = s.IndexMgr.Lookup(ctx, s.IndexID, nil)
+	}
+	if err != nil {
+		return RowBatch{}, false, fmt.Errorf("index scan: %w", err)
+	}
+
+	var rows []Row
+	for _, entry := range entries {
+		if s.StorageRdr != nil {
+			storageRows, err := s.StorageRdr.ReadRows(ctx, s.TableID)
+			if err != nil {
+				continue
+			}
+
+			for _, sr := range storageRows {
+				if sr.Header.RowID != entry.RowID || sr.Header.SegmentID != entry.SegmentID || sr.Header.MessageID != entry.MessageID {
+					continue
+				}
+
+				if sr.Header.Flags.HasTombstone() {
+					continue
+				}
+
+				if s.Snapshot != nil {
+					var txnMax *types.TxnID
+					if sr.Header.TxnMax > 0 {
+						txnMax = &sr.Header.TxnMax
+					}
+					if !s.Snapshot.IsVisible(sr.Header.TxnID, txnMax) {
+						continue
+					}
+				}
+
+				values := storageRowToValues(sr)
+				for len(values) < len(s.Schema) {
+					values = append(values, types.NullValue())
+				}
+
+				meta := &RowMeta{
+					RowID:     sr.Header.RowID,
+					SegmentID: sr.Header.SegmentID,
+					MessageID: sr.Header.MessageID,
+				}
+
+				rows = append(rows, Row{Values: values, Meta: meta})
+				break
+			}
+		}
+	}
+
+	return RowBatch{Rows: rows, Schema: append([]ColumnInfo(nil), s.Schema...)}, true, nil
+}
+
+func valueToKey(v types.Value) []byte {
+	if !v.Valid {
+		return nil
+	}
+	if s, ok := v.Raw.(string); ok {
+		return []byte(s)
+	}
+	return []byte(v.PGText())
 }
 
 type Filter struct {

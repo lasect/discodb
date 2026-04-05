@@ -8,6 +8,7 @@ import (
 
 	"discodb/catalog"
 	"discodb/executor"
+	"discodb/mvcc"
 	"discodb/types"
 )
 
@@ -892,12 +893,17 @@ func Parse(query string) (Statement, error) {
 }
 
 type Planner struct {
-	catalog *catalog.Catalog
-	reader  executor.StorageReader
+	catalog  *catalog.Catalog
+	reader   executor.StorageReader
+	indexMgr executor.IndexManager
 }
 
 func NewPlanner(cat *catalog.Catalog, reader executor.StorageReader) Planner {
 	return Planner{catalog: cat, reader: reader}
+}
+
+func NewPlannerWithIndex(cat *catalog.Catalog, reader executor.StorageReader, indexMgr executor.IndexManager) Planner {
+	return Planner{catalog: cat, reader: reader, indexMgr: indexMgr}
 }
 
 func (p Planner) Plan(stmt Statement) (executor.PhysicalPlan, error) {
@@ -942,7 +948,26 @@ func (p Planner) planSelect(stmt SelectStmt) (executor.PhysicalPlan, error) {
 	}
 
 	var root executor.Executor
-	root = executor.NewSeqScan(p.reader, tableSchema.ID, scanFilter, fullSchema)
+
+	if p.indexMgr != nil && scanFilter != nil && scanFilter.Left.Constant != nil && scanFilter.Op == executor.ComparisonEq {
+		colIdx := scanFilter.Left.ColumnIndex
+		if colIdx != nil && *colIdx >= 0 && *colIdx < len(tableSchema.Columns) {
+			colName := tableSchema.Columns[*colIdx].Name
+			indexes := p.catalog.Indexes()
+			for _, idxSchema := range indexes {
+				if idxSchema.TableID == tableSchema.ID && len(idxSchema.Columns) == 1 && idxSchema.Columns[0] == colName {
+					snap := mvcc.TransactionSnapshot{}
+					root = executor.NewIndexScanWithMgr(tableSchema.ID, idxSchema.ID, &[2]types.Value{*scanFilter.Right.Constant, *scanFilter.Right.Constant}, fullSchema, p.indexMgr, snap, p.reader)
+					scanFilter = nil
+					break
+				}
+			}
+		}
+	}
+
+	if root == nil {
+		root = executor.NewSeqScan(p.reader, tableSchema.ID, scanFilter, fullSchema)
+	}
 
 	if filterPred != nil {
 		root = &executor.Filter{Input: root, Predicate: *filterPred}

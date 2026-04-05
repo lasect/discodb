@@ -44,6 +44,7 @@ type Engine struct {
 	walReader    *WALReader
 	segMgr       *SegmentManager
 	txnManager   *txn.Manager
+	indexMgr     *IndexManager
 	txnMu        sync.Mutex
 	connTxnState map[string]ConnTxnState
 	connTxnID    map[string]types.TxnID
@@ -103,6 +104,7 @@ func NewEngine(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 		walReader:      walReader,
 		segMgr:         segMgr,
 		txnManager:     txn.NewManager(),
+		indexMgr:       NewIndexManager(bootstrapper.IndexClient(), bootInfo.GuildID, logger, segMgr),
 		connTxnState:   make(map[string]ConnTxnState),
 		connTxnID:      make(map[string]types.TxnID),
 	}
@@ -111,6 +113,10 @@ func NewEngine(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 	eng.rowCounter.Store(1)
 	eng.tableCounter.Store(1)
 	eng.segmentCounter.Store(1)
+
+	if err := eng.indexMgr.LoadIndexes(ctx, cat); err != nil {
+		logger.Warn("index load failed (may be first run)", slog.String("error", err.Error()))
+	}
 
 	return eng, nil
 }
@@ -222,7 +228,7 @@ func (e *Engine) ExecuteQueryWithTxn(connID string, query string) ([]executor.Co
 	case discodbsql.DropTableStmt:
 		return e.handleDropTable(s, connID)
 	case discodbsql.CreateIndexStmt:
-		return nil, nil, 0, fmt.Errorf("unsupported: CREATE INDEX")
+		return e.handleCreateIndex(s, connID)
 	default:
 		return nil, nil, 0, fmt.Errorf("unsupported statement type")
 	}
@@ -420,6 +426,28 @@ func (e *Engine) flushTransaction(ctx context.Context, t *txn.Transaction) error
 	commitRec := wal.Commit(txnID, e.nextLSN())
 	if err := e.walWriter.Append(ctx, commitRec); err != nil {
 		return fmt.Errorf("WAL commit: %w", err)
+	}
+
+	indexWrites := t.DrainIndexWrites()
+	for _, iw := range indexWrites {
+		switch iw.Op {
+		case txn.WriteOpInsert:
+			idxRec := wal.IndexInsert(txnID, e.nextLSN(), iw.IndexID, iw.Key, iw.RowID, iw.SegmentID, iw.MessageID)
+			if err := e.walWriter.Append(ctx, idxRec); err != nil {
+				return fmt.Errorf("WAL index insert: %w", err)
+			}
+			if err := e.indexMgr.Insert(ctx, iw.IndexID, iw.Key, iw.RowID, iw.SegmentID, iw.MessageID); err != nil {
+				return fmt.Errorf("index insert: %w", err)
+			}
+		case txn.WriteOpDelete:
+			idxRec := wal.IndexDelete(txnID, e.nextLSN(), iw.IndexID, iw.Key, iw.RowID, iw.SegmentID, iw.MessageID)
+			if err := e.walWriter.Append(ctx, idxRec); err != nil {
+				return fmt.Errorf("WAL index delete: %w", err)
+			}
+			if err := e.indexMgr.Delete(ctx, iw.IndexID, iw.Key); err != nil {
+				return fmt.Errorf("index delete: %w", err)
+			}
+		}
 	}
 
 	return nil

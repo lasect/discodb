@@ -131,6 +131,13 @@ func (c *Catalog) RemoveTable(id types.TableID) {
 	}
 }
 
+func (c *Catalog) RemoveIndex(id types.TableID) {
+	if schema, ok := c.indexes[id]; ok {
+		delete(c.indexes, id)
+		delete(c.indexNames, schema.Name)
+	}
+}
+
 func (c *Catalog) Indexes() map[types.TableID]IndexSchema {
 	out := make(map[types.TableID]IndexSchema, len(c.indexes))
 	for k, v := range c.indexes {

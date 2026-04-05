@@ -42,6 +42,15 @@ type CatalogOp struct {
 	Payload []byte
 }
 
+type IndexWrite struct {
+	Op        WriteOp
+	IndexID   types.TableID
+	Key       []byte
+	RowID     types.RowID
+	SegmentID types.SegmentID
+	MessageID types.MessageID
+}
+
 type Transaction struct {
 	mu          sync.Mutex
 	mgr         *Manager
@@ -53,6 +62,7 @@ type Transaction struct {
 	CommittedAt *time.Time
 	Writes      []BufferedWrite
 	CatalogOps  []CatalogOp
+	IndexWrites []IndexWrite
 	TableID     types.TableID
 	SegmentID   types.SegmentID
 	ChannelID   types.ChannelID
@@ -95,6 +105,37 @@ func (t *Transaction) BufferCatalogOp(kind string, payload []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.CatalogOps = append(t.CatalogOps, CatalogOp{Kind: kind, Payload: payload})
+}
+
+func (t *Transaction) BufferIndexInsert(indexID types.TableID, key []byte, rowID types.RowID, segmentID types.SegmentID, messageID types.MessageID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.IndexWrites = append(t.IndexWrites, IndexWrite{
+		Op:        WriteOpInsert,
+		IndexID:   indexID,
+		Key:       key,
+		RowID:     rowID,
+		SegmentID: segmentID,
+		MessageID: messageID,
+	})
+}
+
+func (t *Transaction) BufferIndexDelete(indexID types.TableID, key []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.IndexWrites = append(t.IndexWrites, IndexWrite{
+		Op:      WriteOpDelete,
+		IndexID: indexID,
+		Key:     key,
+	})
+}
+
+func (t *Transaction) DrainIndexWrites() []IndexWrite {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	iw := t.IndexWrites
+	t.IndexWrites = nil
+	return iw
 }
 
 func (t *Transaction) SetChannel(tableID types.TableID, segmentID types.SegmentID, channelID types.ChannelID) {

@@ -17,6 +17,74 @@ import (
 
 func ptr[T any](v T) *T { return &v }
 
+func (e *Engine) handleCreateIndex(stmt discodbsql.CreateIndexStmt, connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
+	tableSchema, ok := e.catalog.GetTableByName(stmt.Table)
+	if !ok {
+		return nil, nil, 0, fmt.Errorf("table %q not found", stmt.Table)
+	}
+
+	for _, colName := range stmt.Columns {
+		_, found := tableSchema.Column(colName)
+		if !found {
+			return nil, nil, 0, fmt.Errorf("column %q not found in table %q", colName, stmt.Table)
+		}
+	}
+
+	indexName := stmt.Name
+	if indexName == "" {
+		indexName = fmt.Sprintf("idx_%s_%s", tableSchema.Name, stmt.Columns[0])
+	}
+
+	indexID := e.nextTableID()
+
+	schema := catalog.IndexSchema{
+		ID:        indexID,
+		Name:      indexName,
+		TableID:   tableSchema.ID,
+		Columns:   stmt.Columns,
+		Unique:    stmt.Unique,
+		IndexType: catalog.IndexTypeBTree,
+	}
+	e.catalog.AddIndex(schema)
+
+	ctx := context.Background()
+
+	if err := e.indexMgr.CreateIndex(ctx, schema); err != nil {
+		e.catalog.RemoveIndex(indexID)
+		return nil, nil, 0, fmt.Errorf("create index: %w", err)
+	}
+
+	t, wasExisting := e.getOrCreateTxn(connID)
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"name":       indexName,
+		"index_id":   indexID.Uint64(),
+		"table_id":   tableSchema.ID.Uint64(),
+		"columns":    stmt.Columns,
+		"unique":     stmt.Unique,
+		"index_type": string(catalog.IndexTypeBTree),
+	})
+
+	t.BufferCatalogOp("CATALOG_CREATE_INDEX", payload)
+
+	if err := e.autoCommitTxn(connID, t, wasExisting); err != nil {
+		return nil, nil, 0, fmt.Errorf("auto-commit: %w", err)
+	}
+
+	if err := persistCatalogToDiscord(ctx, e.catalogClient, e.boot.GuildID, e.boot.CatalogCategory, e.catalog); err != nil {
+		e.logger.Warn("catalog persist failed", slog.String("error", err.Error()))
+	}
+
+	e.logger.Info("index created",
+		slog.String("name", indexName),
+		slog.String("index_id", indexID.String()),
+		slog.String("table", stmt.Table),
+		slog.Any("columns", stmt.Columns),
+	)
+
+	return nil, nil, 0, nil
+}
+
 func (e *Engine) handleCreateTable(stmt discodbsql.CreateTableStmt, connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
 	tableID := e.nextTableID()
 	segmentID := e.nextSegmentID()
@@ -136,6 +204,19 @@ func (e *Engine) handleInsert(stmt discodbsql.InsertStmt, connID string) ([]exec
 		}
 
 		t.BufferInsert(tableSchema.ID, row)
+
+		for _, idx := range e.indexMgr.GetIndexesForTable(tableSchema.ID) {
+			for _, colName := range idx.ColumnNames {
+				colIdx, ok := tableSchema.ColumnIndex(colName)
+				if !ok || colIdx >= len(colValues) {
+					continue
+				}
+				key := columnValueToKey(colValues[colIdx])
+				if key != nil {
+					t.BufferIndexInsert(idx.ID, key, rowID, types.SegmentID(1), types.MessageID(0))
+				}
+			}
+		}
 	}
 
 	if err := e.autoCommitTxn(connID, t, wasExisting); err != nil {
@@ -173,7 +254,7 @@ func (e *Engine) handleSelect(stmt discodbsql.SelectStmt, connID string) ([]exec
 		snap = e.txnManager.CreateSnapshot()
 	}
 
-	planner := discodbsql.NewPlanner(e.catalog, e)
+	planner := discodbsql.NewPlannerWithIndex(e.catalog, e, e.indexMgr)
 	plan, err := planner.Plan(stmt)
 	if err != nil {
 		return nil, nil, 0, err
@@ -188,7 +269,7 @@ func (e *Engine) handleSelect(stmt discodbsql.SelectStmt, connID string) ([]exec
 }
 
 func (e *Engine) handleDelete(stmt discodbsql.DeleteStmt, connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
-	planner := discodbsql.NewPlanner(e.catalog, e)
+	planner := discodbsql.NewPlannerWithIndex(e.catalog, e, e.indexMgr)
 	plan, err := planner.Plan(stmt)
 	if err != nil {
 		return nil, nil, 0, err
@@ -271,7 +352,7 @@ func (e *Engine) handleDelete(stmt discodbsql.DeleteStmt, connID string) ([]exec
 }
 
 func (e *Engine) handleUpdate(stmt discodbsql.UpdateStmt, connID string) ([]executor.ColumnInfo, []executor.Row, uint64, error) {
-	planner := discodbsql.NewPlanner(e.catalog, e)
+	planner := discodbsql.NewPlannerWithIndex(e.catalog, e, e.indexMgr)
 	plan, err := planner.Plan(stmt)
 	if err != nil {
 		return nil, nil, 0, err
@@ -504,4 +585,41 @@ func valueToColumnValue(v types.Value, colType types.DataType) storage.ColumnVal
 	}
 
 	return storage.ColumnValue{Kind: string(colType)}
+}
+
+func columnValueToKey(cv storage.ColumnValue) []byte {
+	switch cv.Kind {
+	case "text", "json":
+		if cv.Text != nil {
+			return []byte(*cv.Text)
+		}
+	case "int2":
+		if cv.Int16 != nil {
+			return []byte(fmt.Sprintf("%d", *cv.Int16))
+		}
+	case "int4":
+		if cv.Int32 != nil {
+			return []byte(fmt.Sprintf("%d", *cv.Int32))
+		}
+	case "int8":
+		if cv.Int64 != nil {
+			return []byte(fmt.Sprintf("%d", *cv.Int64))
+		}
+	case "float4":
+		if cv.Float32 != nil {
+			return []byte(fmt.Sprintf("%f", *cv.Float32))
+		}
+	case "float8":
+		if cv.Float64 != nil {
+			return []byte(fmt.Sprintf("%f", *cv.Float64))
+		}
+	case "bool":
+		if cv.Bool != nil {
+			if *cv.Bool {
+				return []byte("t")
+			}
+			return []byte("f")
+		}
+	}
+	return nil
 }

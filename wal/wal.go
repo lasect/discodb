@@ -69,6 +69,14 @@ func Delete(txnID types.TxnID, lsn types.LSN, tableID types.TableID, rowID types
 	return Record{Kind: "DELETE", TxnID: txnID, LSN: lsn, TableID: tableID, RowID: rowID, SegmentID: segmentID, MessageID: messageID}
 }
 
+func IndexInsert(txnID types.TxnID, lsn types.LSN, indexID types.TableID, key []byte, rowID types.RowID, segmentID types.SegmentID, messageID types.MessageID) Record {
+	return Record{Kind: "INDEX_INSERT", TxnID: txnID, LSN: lsn, IndexID: indexID, Key: key, RowID: rowID, SegmentID: segmentID, MessageID: messageID}
+}
+
+func IndexDelete(txnID types.TxnID, lsn types.LSN, indexID types.TableID, key []byte, rowID types.RowID, segmentID types.SegmentID, messageID types.MessageID) Record {
+	return Record{Kind: "INDEX_DELETE", TxnID: txnID, LSN: lsn, IndexID: indexID, Key: key, RowID: rowID, SegmentID: segmentID, MessageID: messageID}
+}
+
 type Writer struct {
 	writeIDCounter uint64
 }
