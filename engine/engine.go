@@ -73,14 +73,6 @@ func NewEngine(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 	walWriter := NewWALWriter(bootstrapper.WALClient(), bootInfo.WALWebhook, bootInfo.WALChannel, logger)
 	walReader := NewWALReader(bootstrapper.WALClient(), bootInfo.WALChannel, logger)
 
-	if err := walReader.Replay(ctx, cat); err != nil {
-		logger.Warn("WAL replay failed (may be first run)", slog.String("error", err.Error()))
-	}
-
-	if err := loadCatalogFromDiscord(ctx, bootstrapper.CatalogClient(), bootInfo.GuildID, bootInfo.CatalogCategory, cat); err != nil {
-		logger.Warn("catalog load failed (may be first run)", slog.String("error", err.Error()))
-	}
-
 	segMgr := NewSegmentManager(
 		bootstrapper.HeapClient(),
 		bootstrapper.CatalogClient(),
@@ -92,6 +84,26 @@ func NewEngine(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 
 	if err := segMgr.PopulateWebhookCache(ctx); err != nil {
 		logger.Warn("webhook cache population failed (non-fatal)", slog.String("error", err.Error()))
+	}
+
+	indexMgr := NewIndexManager(bootstrapper.IndexClient(), bootInfo.GuildID, logger, segMgr)
+
+	walReader.SetSegmentManager(segMgr)
+	walReader.SetIndexManager(indexMgr)
+
+	txnMgr := txn.NewManager()
+
+	if maxTxnID, err := walReader.Replay(ctx); err != nil {
+		logger.Warn("WAL replay failed (may be first run)", slog.String("error", err.Error()))
+	} else if maxTxnID > 0 {
+		txnMgr.SetTxnMax(maxTxnID)
+		logger.Info("restored txnMax from WAL", slog.String("max_txn_id", maxTxnID.String()))
+	}
+
+	walReader.SetCatalog(cat)
+
+	if err := loadCatalogFromDiscord(ctx, bootstrapper.CatalogClient(), bootInfo.GuildID, bootInfo.CatalogCategory, cat); err != nil {
+		logger.Warn("catalog load failed (may be first run)", slog.String("error", err.Error()))
 	}
 
 	eng := &Engine{
@@ -107,8 +119,8 @@ func NewEngine(cfg config.Config, logger *slog.Logger) (*Engine, error) {
 		walWriter:      walWriter,
 		walReader:      walReader,
 		segMgr:         segMgr,
-		txnManager:     txn.NewManager(),
-		indexMgr:       NewIndexManager(bootstrapper.IndexClient(), bootInfo.GuildID, logger, segMgr),
+		txnManager:     txnMgr,
+		indexMgr:       indexMgr,
 		connTxnState:   make(map[string]ConnTxnState),
 		connTxnID:      make(map[string]types.TxnID),
 	}
@@ -394,8 +406,18 @@ func (e *Engine) flushTransaction(ctx context.Context, t *txn.Transaction) error
 			}
 
 		case txn.WriteOpUpdate:
-			tombstoneRow := w.Row
-			tombstoneRow.Header.Flags |= storage.FlagTombstone
+			tombstoneRow := storage.Row{
+				Header: storage.RowHeader{
+					RowID:     *w.OldRowID,
+					TableID:   w.Row.Header.TableID,
+					SegmentID: *w.OldSegID,
+					MessageID: *w.OldMsgID,
+					TxnID:     txnID,
+					LSN:       e.nextLSN(),
+					Flags:     storage.FlagTombstone,
+				},
+				Body: w.Row.Body,
+			}
 
 			_, err := e.segMgr.WriteRow(ctx, t.ChannelID, tombstoneRow, e.catalog.Epoch())
 			if err != nil {
@@ -403,6 +425,11 @@ func (e *Engine) flushTransaction(ctx context.Context, t *txn.Transaction) error
 			}
 
 			newRow := w.Row
+			newRow.Header.RowID = e.nextRowID()
+			newRow.Header.TxnID = txnID
+			newRow.Header.LSN = e.nextLSN()
+			newRow.Header.Flags = 0
+
 			newMsg, err := e.segMgr.WriteRow(ctx, t.ChannelID, newRow, e.catalog.Epoch())
 			if err != nil {
 				return fmt.Errorf("write updated row: %w", err)

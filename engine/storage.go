@@ -108,6 +108,23 @@ func (sm *SegmentManager) GetOrCreateSegment(ctx context.Context, tableID types.
 	return sm.CreateSegment(ctx, tableID, segmentID)
 }
 
+func (sm *SegmentManager) GetOrCreateSegmentForReplay(ctx context.Context, tableID types.TableID, segmentID types.SegmentID) (types.ChannelID, error) {
+	name := mapping.SegmentName(tableID, segmentID)
+
+	channels, err := sm.catalogClient.ListGuildChannels(ctx, sm.guildID)
+	if err != nil {
+		return 0, fmt.Errorf("list channels: %w", err)
+	}
+
+	for _, ch := range channels {
+		if ch.Name == name && ch.ParentID != nil && *ch.ParentID == sm.catalogCatID {
+			return ch.ID, nil
+		}
+	}
+
+	return 0, fmt.Errorf("segment not found during replay (may need manual recovery): seg-%s-%s", tableID.String(), segmentID.String())
+}
+
 func (sm *SegmentManager) WriteRow(ctx context.Context, segmentChannelID types.ChannelID, row storage.Row, schemaEpoch types.SchemaEpoch) (*discord.Message, error) {
 	encoded, err := storage.EncodeRowToDiscord(row, schemaEpoch)
 	if err != nil {
@@ -145,8 +162,17 @@ func (sm *SegmentManager) WriteRow(ctx context.Context, segmentChannelID types.C
 }
 
 func (sm *SegmentManager) ReadRows(ctx context.Context, segmentChannelID types.ChannelID) ([]storage.Row, []types.SchemaEpoch, error) {
-	var allRows []storage.Row
-	var allEpochs []types.SchemaEpoch
+	type decodedRow struct {
+		row   storage.Row
+		epoch types.SchemaEpoch
+	}
+
+	var allDecoded []decodedRow
+	var tombstones []struct {
+		rowID     types.RowID
+		segmentID types.SegmentID
+		messageID types.MessageID
+	}
 
 	err := sm.heapClient.ListAllMessages(ctx, segmentChannelID, func(messages []*discord.Message) error {
 		sm.logger.Info("ReadRows batch",
@@ -199,17 +225,57 @@ func (sm *SegmentManager) ReadRows(ctx context.Context, segmentChannelID types.C
 			}
 
 			if row.Header.Flags.HasTombstone() {
+				sm.logger.Debug("skipping tombstone",
+					slog.String("message_id", msg.ID.String()),
+					slog.String("txn_id", row.Header.TxnID.String()),
+					slog.String("row_id", row.Header.RowID.String()),
+				)
+				tombstones = append(tombstones, struct {
+					rowID     types.RowID
+					segmentID types.SegmentID
+					messageID types.MessageID
+				}{
+					rowID:     row.Header.RowID,
+					segmentID: row.Header.SegmentID,
+					messageID: row.Header.MessageID,
+				})
 				continue
 			}
 
-			allRows = append(allRows, row)
-			allEpochs = append(allEpochs, epoch)
+			sm.logger.Debug("decoded row",
+				slog.String("message_id", msg.ID.String()),
+				slog.String("txn_id", row.Header.TxnID.String()),
+				slog.String("txn_max", fmt.Sprintf("%d", row.Header.TxnMax)),
+			)
+
+			allDecoded = append(allDecoded, decodedRow{row: row, epoch: epoch})
 		}
 		return nil
 	})
 
 	if err != nil {
 		return nil, nil, fmt.Errorf("list messages: %w", err)
+	}
+
+	var allRows []storage.Row
+	var allEpochs []types.SchemaEpoch
+	for _, dr := range allDecoded {
+		tombstoned := false
+		for _, ts := range tombstones {
+			if dr.row.Header.RowID == ts.rowID && dr.row.Header.SegmentID == ts.segmentID && dr.row.Header.MessageID == ts.messageID {
+				tombstoned = true
+				sm.logger.Debug("row tombstoned, skipping",
+					slog.String("row_id", dr.row.Header.RowID.String()),
+					slog.String("segment_id", dr.row.Header.SegmentID.String()),
+					slog.String("message_id", dr.row.Header.MessageID.String()),
+				)
+				break
+			}
+		}
+		if !tombstoned {
+			allRows = append(allRows, dr.row)
+			allEpochs = append(allEpochs, dr.epoch)
+		}
 	}
 
 	return allRows, allEpochs, nil
