@@ -578,6 +578,18 @@ func (p *Parser) parseCreate() (Statement, error) {
 	if err := p.expectKeyword("CREATE"); err != nil {
 		return nil, err
 	}
+
+	switch p.cur.Val {
+	case "TABLE":
+		return p.parseCreateTable()
+	case "INDEX":
+		return p.parseCreateIndex()
+	default:
+		return nil, fmt.Errorf("expected TABLE or INDEX after CREATE, got %q", p.cur.Val)
+	}
+}
+
+func (p *Parser) parseCreateTable() (Statement, error) {
 	if err := p.expectKeyword("TABLE"); err != nil {
 		return nil, err
 	}
@@ -644,6 +656,62 @@ func (p *Parser) parseCreate() (Statement, error) {
 	return CreateTableStmt{
 		Name:    tableName,
 		Columns: columns,
+	}, nil
+}
+
+func (p *Parser) parseCreateIndex() (Statement, error) {
+	if err := p.expectKeyword("INDEX"); err != nil {
+		return nil, err
+	}
+
+	unique := false
+	if p.cur.Kind == TokKeyword && p.cur.Val == "UNIQUE" {
+		unique = true
+		p.advance()
+	}
+
+	indexName := ""
+	if p.cur.Kind == TokIdent {
+		indexName = p.cur.Val
+		p.advance()
+	}
+
+	if err := p.expectKeyword("ON"); err != nil {
+		return nil, err
+	}
+
+	if p.cur.Kind != TokIdent {
+		return nil, fmt.Errorf("expected table name, got %q", p.cur.Val)
+	}
+	tableName := p.cur.Val
+	p.advance()
+
+	if err := p.expectSymbol("("); err != nil {
+		return nil, err
+	}
+
+	var columns []string
+	for {
+		if p.cur.Kind != TokIdent {
+			return nil, fmt.Errorf("expected column name, got %q", p.cur.Val)
+		}
+		columns = append(columns, p.cur.Val)
+		p.advance()
+		if p.cur.Kind == TokSymbol && p.cur.Val == "," {
+			p.advance()
+		} else {
+			break
+		}
+	}
+	if err := p.expectSymbol(")"); err != nil {
+		return nil, err
+	}
+
+	return CreateIndexStmt{
+		Name:    indexName,
+		Table:   tableName,
+		Columns: columns,
+		Unique:  unique,
 	}, nil
 }
 

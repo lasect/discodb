@@ -242,6 +242,15 @@ func NewManager() *Manager {
 	}
 }
 
+func (m *Manager) SetTxnMax(max types.TxnID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if max > m.txnMax {
+		m.txnMax = max
+		m.txnCounter = uint64(max)
+	}
+}
+
 func (m *Manager) Begin() *Transaction {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -322,6 +331,7 @@ func (m *Manager) CreateSnapshot() mvcc.TransactionSnapshot {
 	}
 
 	return mvcc.TransactionSnapshot{
+		TxnID:      m.txnMax,
 		TxnMin:     m.txnMin,
 		TxnMax:     m.txnMax,
 		ActiveTxns: activeList,
