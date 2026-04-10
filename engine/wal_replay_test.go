@@ -41,7 +41,9 @@ func TestWALReplayWithFakeTransportPagination(t *testing.T) {
 
 	reader := NewWALReader(client, walChannel.ID, logger)
 	cat := catalog.New()
-	if err := reader.Replay(ctx, cat); err != nil {
+	reader.SetCatalog(cat)
+	_, err = reader.Replay(ctx)
+	if err != nil {
 		t.Fatalf("Replay() error = %v", err)
 	}
 }

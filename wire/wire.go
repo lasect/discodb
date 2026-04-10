@@ -291,6 +291,10 @@ func determineCommandTag(query string, rowCount uint64) CommandTag {
 		return InsertTag(rowCount)
 	case strings.HasPrefix(upper, "CREATE TABLE"):
 		return CreateTableTag()
+	case strings.HasPrefix(upper, "CREATE INDEX"):
+		return CommandTag{Command: "CREATE INDEX"}
+	case strings.HasPrefix(upper, "DROP TABLE"):
+		return CommandTag{Command: "DROP TABLE"}
 	default:
 		return CommandTag{Command: strings.Fields(upper)[0]}
 	}

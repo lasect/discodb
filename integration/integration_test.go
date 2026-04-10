@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"discodb/config"
+	"discodb/discord"
 	"discodb/engine"
 	"discodb/types"
 	"discodb/wire"
@@ -78,9 +79,6 @@ func (c *pgConn) startup(t *testing.T) {
 	binary.BigEndian.PutUint32(startup[0:4], uint32(startupLen))
 	binary.BigEndian.PutUint32(startup[4:8], 196608)
 	copy(startup[8:], params)
-	if _, err := c.conn.Write(startup); err != nil {
-		t.Fatalf("write startup: %v", err)
-	}
 	if _, err := c.conn.Write(startup); err != nil {
 		t.Fatalf("write startup: %v", err)
 	}
@@ -251,6 +249,15 @@ func startServer(t *testing.T) (addr string, eng *engine.Engine, cleanup func())
 	cfg.Discord.Tokens.Catalog = requireEnv(t, "DISCORD_BOT_TOKEN_CATALOG")
 	cfg.Discord.Tokens.Overflow = requireEnv(t, "DISCORD_BOT_TOKEN_OVERFLOW")
 
+	// Create a temporary client just to nuke the guild
+	tempClient, err := discord.NewClient(
+		requireEnv(t, "DISCORD_BOT_TOKEN_WAL"),
+		discord.WithLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))),
+	)
+	if err != nil {
+		t.Fatalf("create temp client for nuke: %v", err)
+	}
+
 	guildStr := requireEnv(t, "DISCORD_GUILD_ID")
 	var guildRaw uint64
 	if _, err := fmt.Sscanf(guildStr, "%d", &guildRaw); err != nil {
@@ -260,6 +267,13 @@ func startServer(t *testing.T) (addr string, eng *engine.Engine, cleanup func())
 	if err != nil {
 		t.Fatalf("new GuildID: %v", err)
 	}
+
+	// Nuke all channels in the guild before starting fresh
+	t.Log("nuking guild...")
+	if err := tempClient.NukeGuild(context.Background(), guildID); err != nil {
+		t.Logf("warning: failed to nuke guild: %v", err)
+	}
+
 	cfg.Discord.GuildIDs = []types.GuildID{guildID}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -449,6 +463,59 @@ func TestIntegration_DemoQueries(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Secondary scenario — users table
 // ---------------------------------------------------------------------------
+
+func TestIntegration_CreateTableWithIndex(t *testing.T) {
+	addr, _, cleanup := startServer(t)
+	defer cleanup()
+
+	conn := dialPG(t, addr)
+	defer conn.close()
+	conn.startup(t)
+
+	t.Run("create_table_posts", func(t *testing.T) {
+		_, _, tag := conn.query(t, `CREATE TABLE posts (
+			id int4,
+			title text,
+			content text,
+			author text
+		)`)
+		assertTag(t, tag, "CREATE TABLE")
+		t.Log("CREATE TABLE posts")
+	})
+
+	t.Run("insert_posts", func(t *testing.T) {
+		_, _, tag := conn.query(t, `INSERT INTO posts VALUES
+			(1, 'Hello World', 'This is my first post!', 'alice'),
+			(2, 'Testing', 'Testing out the database', 'bob'),
+			(3, 'Index Me', 'Posts with indexed content', 'charlie'),
+			(4, 'Another Post', 'More content here', 'alice')`)
+		assertTag(t, tag, "INSERT")
+		t.Log("INSERT 4 rows into posts")
+	})
+
+	t.Run("create_index_on_author", func(t *testing.T) {
+		_, _, tag := conn.query(t, `CREATE INDEX idx_posts_author ON posts (author)`)
+		assertTag(t, tag, "CREATE INDEX")
+		t.Log("CREATE INDEX on author")
+	})
+
+	t.Run("insert_more_posts", func(t *testing.T) {
+		_, _, tag := conn.query(t, `INSERT INTO posts VALUES
+			(5, 'Fifth Post', 'More data for the index', 'dave'),
+			(6, 'Sixth Post', 'Even more data', 'eve')`)
+		assertTag(t, tag, "INSERT")
+		t.Log("INSERT 2 more rows")
+	})
+
+	t.Run("select_all_posts", func(t *testing.T) {
+		_, rows, tag := conn.query(t, `SELECT id, title, author FROM posts`)
+		assertTag(t, tag, "SELECT")
+		t.Logf("SELECT posts -> %d rows", len(rows))
+		for _, row := range rows {
+			t.Logf("  row: %v", row)
+		}
+	})
+}
 
 func TestIntegration_CreateAndSelectUsers(t *testing.T) {
 	addr, _, cleanup := startServer(t)

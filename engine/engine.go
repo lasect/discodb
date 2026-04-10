@@ -141,6 +141,13 @@ func (e *Engine) Close() error {
 	return nil
 }
 
+func (e *Engine) NukeGuild(ctx context.Context) error {
+	if e.catalogClient != nil {
+		return e.catalogClient.NukeGuild(ctx, e.cfg.Discord.GuildIDs[0])
+	}
+	return nil
+}
+
 func (e *Engine) TxnManager() *txn.Manager {
 	return e.txnManager
 }

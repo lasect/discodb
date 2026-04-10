@@ -239,3 +239,48 @@ func (c *Client) GetOrCreateChannel(ctx context.Context, guildID types.GuildID, 
 	// Create new channel
 	return c.CreateChannel(ctx, guildID, params)
 }
+
+// NukeGuild deletes all channels in a guild.
+// WARNING: This will delete ALL channels - use with caution!
+func (c *Client) NukeGuild(ctx context.Context, guildID types.GuildID) error {
+	const op = "NukeGuild"
+
+	channels, err := c.ListGuildChannels(ctx, guildID)
+	if err != nil {
+		return fmt.Errorf("list guild channels: %w", err)
+	}
+
+	// Delete in reverse order to handle children first
+	// Forum posts need to be archived before channel delete
+	for i := len(channels) - 1; i >= 0; i-- {
+		ch := channels[i]
+		// Skip the guild's system channels (they can't be deleted)
+		if ch.Type == ChannelTypeGuildCategory {
+			if err := c.DeleteChannel(ctx, ch.ID); err != nil {
+				c.logger.Warn("failed to delete category",
+					"channel_id", ch.ID,
+					"error", err,
+				)
+				continue
+			}
+		}
+	}
+
+	// Now delete non-category channels
+	for i := len(channels) - 1; i >= 0; i-- {
+		ch := channels[i]
+		if ch.Type == ChannelTypeGuildCategory {
+			continue // already deleted above
+		}
+
+		if err := c.DeleteChannel(ctx, ch.ID); err != nil {
+			c.logger.Warn("failed to delete channel",
+				"channel_id", ch.ID,
+				"error", err,
+			)
+		}
+	}
+
+	c.logger.Info("nuked guild", "guild_id", guildID)
+	return nil
+}
